@@ -1,0 +1,38 @@
+# ── Rust ─────────────────────────────────────────────────────────────────
+# Cargo build artifacts & cache.
+/target/
+**/*.rs.bk
+
+# ── WASM ──────────────────────────────────────────────────────────────────
+# wasm-pack output directory (regenerated on every `scripts/build.sh` run).
+/pkg/
+
+# ── Node / npm ────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+
+# ── TypeScript ────────────────────────────────────────────────────────────
+*.tsbuildinfo
+dist/
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Environment & secrets ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log

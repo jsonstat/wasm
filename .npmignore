@@ -1,0 +1,5 @@
+# Internal/private dotfiles and dot-directories must never be published.
+.*
+
+# Build artifacts and caches.
+target/

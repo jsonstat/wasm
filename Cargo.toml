@@ -1,0 +1,23 @@
+[package]
+name = "jsonstat-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "A fast JSON-stat 2.0 parser compiled to WebAssembly"
+repository = "https://github.com/jsonstat/wasm"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2.92"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+console_error_panic_hook = "0.1.7"
+serde-wasm-bindgen = "0.6.5"
+js-sys = "0.3.100"
+# Preserves insertion order for the `dimension` map so ToJSON() emits
+# dimensions in the same order as the source document. Already resolved
+# transitively via serde_json's `preserve_order` feature; declared directly
+# here to use IndexMap in our own model types.
+indexmap = { version = "2", features = ["serde"] }
