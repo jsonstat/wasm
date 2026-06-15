@@ -17,6 +17,7 @@
 //   - types  → "jsonstat.d.ts"
 //   - files  → prepends "jsonstat.js" and "jsonstat.d.ts"
 //   - exports → installs the dual-entry map (facade + glue)
+//   - repository.url → canonicalized to git+https form (npm expects this)
 'use strict';
 
 const fs = require('fs');
@@ -36,6 +37,31 @@ pkg.files = Array.isArray(pkg.files) ? pkg.files : [];
 for (const f of requiredFiles) {
     if (!pkg.files.includes(f)) {
         pkg.files.unshift(f);
+    }
+}
+
+// ── repository.url: canonicalize to the git+https form npm expects ───────
+// `npm publish` warns (and silently auto-corrects) when the URL lacks the
+// `git+https://` scheme and `.git` suffix. wasm-pack copies the URL straight
+// from Cargo.toml (plain https://github.com/...), so normalize it here to
+// keep publishes warning-free. Idempotent: an already-canonical URL is
+// returned unchanged. Handles both the object and (fallback) string forms.
+function canonicalRepoUrl(url) {
+    if (typeof url !== 'string') return url;
+    let u = url.trim();
+    // Coerce plain https/http git hosting URLs to git+https.
+    u = u.replace(/^https:\/\/github\.com\//, 'git+https://github.com/');
+    // Ensure the .git suffix is present.
+    if (/^git\+https:\/\/github\.com\//.test(u) && !u.endsWith('.git')) {
+        u += '.git';
+    }
+    return u;
+}
+if (pkg.repository) {
+    if (typeof pkg.repository === 'object' && pkg.repository.url) {
+        pkg.repository.url = canonicalRepoUrl(pkg.repository.url);
+    } else if (typeof pkg.repository === 'string') {
+        pkg.repository = canonicalRepoUrl(pkg.repository);
     }
 }
 
