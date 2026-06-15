@@ -1,11 +1,9 @@
 pub mod models;
 pub mod query;
 
+use models::{Cell, CollectionItem, Dataset, DatasetValue, Dimension, JsonStatResponse};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
-use models::{
-    Cell, JsonStatResponse, CollectionItem, Dataset, DatasetValue, Dimension,
-};
 
 // ── WASM Initialisation ───────────────────────────────────────────────────
 
@@ -48,8 +46,7 @@ fn to_js_value<T: serde::Serialize>(val: &T) -> JsValue {
 fn to_js_value_result<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
     let s = serde_json::to_string(val)
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
-    js_sys::JSON::parse(&s)
-        .map_err(|e| JsValue::from_str(&format!("JSON parse error: {:?}", e)))
+    js_sys::JSON::parse(&s).map_err(|e| JsValue::from_str(&format!("JSON parse error: {:?}", e)))
 }
 
 /// Extract a dataset reference from the response, or error.
@@ -65,10 +62,7 @@ fn require_dataset(resp: &JsonStatResponse) -> Result<&Dataset, JsValue> {
 /// Look up a category index in a dimension's category index structure.
 /// Falls back to the category label when 'index' is absent, which the
 /// JSON-stat spec allows for single-category dimensions.
-fn resolve_category_index(
-    dim: &Dimension,
-    cat_id: &str,
-) -> Result<usize, String> {
+fn resolve_category_index(dim: &Dimension, cat_id: &str) -> Result<usize, String> {
     let category = dim
         .category
         .as_ref()
@@ -78,9 +72,10 @@ fn resolve_category_index(
             .get_index_of(cat_id)
             .ok_or_else(|| format!("Category '{}' not found", cat_id)),
         None => {
-            let label = category.label.as_ref().ok_or_else(|| {
-                "Category is missing both 'index' and 'label'".to_string()
-            })?;
+            let label = category
+                .label
+                .as_ref()
+                .ok_or_else(|| "Category is missing both 'index' and 'label'".to_string())?;
             if label.len() == 1 && label.contains_key(cat_id) {
                 Ok(0)
             } else {
@@ -148,9 +143,7 @@ fn category_label_for(dim: &Dimension, cat_id: &str) -> String {
 
 /// Get dimension label (or fall back to the dimension ID).
 fn dimension_label_or(dim: &Dimension, fallback: &str) -> String {
-    dim.label
-        .clone()
-        .unwrap_or_else(|| fallback.to_string())
+    dim.label.clone().unwrap_or_else(|| fallback.to_string())
 }
 
 /// Resolve the role (time/geo/metric/classification) of a dimension ID, if any.
@@ -241,10 +234,7 @@ fn index_from_f64(num: f64) -> Result<usize, &'static str> {
 /// Resolve a flat-index query from a {dim_id: cat_id} map.
 /// Auto-fills constant (size-1) dimensions when missing from the query.
 /// Uses String errors for testability on non-wasm targets.
-fn resolve_flat_index(
-    dataset: &Dataset,
-    query: &HashMap<String, String>,
-) -> Result<usize, String> {
+fn resolve_flat_index(dataset: &Dataset, query: &HashMap<String, String>) -> Result<usize, String> {
     let dim_ids = dataset
         .id
         .as_ref()
@@ -273,9 +263,8 @@ fn resolve_flat_index(
                     let dim = dimensions.get(dim_id).ok_or_else(|| {
                         format!("Dataset is missing dimension object for '{}'", dim_id)
                     })?;
-                    category_id_at(dim, 0).ok_or_else(|| {
-                        format!("Dimension '{}' has no categories", dim_id)
-                    })?
+                    category_id_at(dim, 0)
+                        .ok_or_else(|| format!("Dimension '{}' has no categories", dim_id))?
                 } else {
                     return Err(format!(
                         "Query is missing category for non-constant dimension '{}'",
@@ -285,17 +274,16 @@ fn resolve_flat_index(
             }
         };
 
-        let dim = dimensions.get(dim_id).ok_or_else(|| {
-            format!("Dataset is missing dimension object for '{}'", dim_id)
-        })?;
+        let dim = dimensions
+            .get(dim_id)
+            .ok_or_else(|| format!("Dataset is missing dimension object for '{}'", dim_id))?;
 
         let cat_idx = resolve_category_index(dim, &cat_id)?;
         indices.push(cat_idx);
     }
 
-    query::calculate_index(&indices, sizes).ok_or_else(|| {
-        "Failed to calculate row-major order index".to_string()
-    })
+    query::calculate_index(&indices, sizes)
+        .ok_or_else(|| "Failed to calculate row-major order index".to_string())
 }
 
 /// Outcome of resolving a [`Data()`](JSONstat::data) object query.
@@ -354,9 +342,9 @@ fn resolve_query(
     let mut free: Vec<usize> = Vec::new();
 
     for (i, dim_id) in dim_ids.iter().enumerate() {
-        let dim = dimensions.get(dim_id).ok_or_else(|| {
-            format!("Dataset is missing dimension object for '{}'", dim_id)
-        })?;
+        let dim = dimensions
+            .get(dim_id)
+            .ok_or_else(|| format!("Dataset is missing dimension object for '{}'", dim_id))?;
         let is_constant = sizes[i] == 1;
 
         match query.get(dim_id) {
@@ -526,11 +514,9 @@ impl JSONstat {
     #[wasm_bindgen(getter)]
     pub fn error(&self) -> JsValue {
         match &self.response {
-            JsonStatResponse::Dataset(d) => d
-                .error
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
+            JsonStatResponse::Dataset(d) => {
+                d.error.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
             _ => JsValue::NULL,
         }
     }
@@ -561,21 +547,15 @@ impl JSONstat {
     #[wasm_bindgen(getter)]
     pub fn note(&self) -> JsValue {
         match &self.response {
-            JsonStatResponse::Dataset(d) => d
-                .note
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
-            JsonStatResponse::Dimension(d) => d
-                .note
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
-            JsonStatResponse::Collection(c) => c
-                .note
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
+            JsonStatResponse::Dataset(d) => {
+                d.note.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
+            JsonStatResponse::Dimension(d) => {
+                d.note.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
+            JsonStatResponse::Collection(c) => {
+                c.note.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
         }
     }
 
@@ -583,21 +563,15 @@ impl JSONstat {
     #[wasm_bindgen(getter)]
     pub fn link(&self) -> JsValue {
         match &self.response {
-            JsonStatResponse::Dataset(d) => d
-                .link
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
-            JsonStatResponse::Dimension(d) => d
-                .link
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
-            JsonStatResponse::Collection(c) => c
-                .link
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
+            JsonStatResponse::Dataset(d) => {
+                d.link.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
+            JsonStatResponse::Dimension(d) => {
+                d.link.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
+            JsonStatResponse::Collection(c) => {
+                c.link.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
         }
     }
 
@@ -605,11 +579,9 @@ impl JSONstat {
     #[wasm_bindgen(getter)]
     pub fn role(&self) -> JsValue {
         match &self.response {
-            JsonStatResponse::Dataset(d) => d
-                .role
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
+            JsonStatResponse::Dataset(d) => {
+                d.role.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
             _ => JsValue::NULL,
         }
     }
@@ -618,11 +590,9 @@ impl JSONstat {
     #[wasm_bindgen(getter)]
     pub fn status(&self) -> JsValue {
         match &self.response {
-            JsonStatResponse::Dataset(d) => d
-                .status
-                .as_ref()
-                .map(to_js_value)
-                .unwrap_or(JsValue::NULL),
+            JsonStatResponse::Dataset(d) => {
+                d.status.as_ref().map(to_js_value).unwrap_or(JsValue::NULL)
+            }
             _ => JsValue::NULL,
         }
     }
@@ -666,8 +636,7 @@ impl JSONstat {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Dataset is missing 'value' property"))?;
 
-        let flat_index = resolve_flat_index(dataset, &query)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let flat_index = resolve_flat_index(dataset, &query).map_err(|e| JsValue::from_str(&e))?;
 
         if let DatasetValue::Array(arr) = value {
             if flat_index >= arr.len() {
@@ -704,9 +673,10 @@ impl JSONstat {
 
         // No argument → all data
         if dataid_js.is_undefined() || dataid_js.is_null() {
-            let sizes = dataset.size.as_ref().ok_or_else(|| {
-                JsValue::from_str("Dataset is missing 'size' array")
-            })?;
+            let sizes = dataset
+                .size
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
             let total: usize = sizes.iter().product();
             let mut result = Vec::with_capacity(total);
             for i in 0..total {
@@ -755,12 +725,12 @@ impl JSONstat {
         if js_sys::Array::is_array(&dataid_js) {
             let arr: Vec<usize> = serde_wasm_bindgen::from_value(dataid_js.clone())
                 .map_err(|e| JsValue::from_str(&format!("Invalid array format: {}", e)))?;
-            let sizes = dataset.size.as_ref().ok_or_else(|| {
-                JsValue::from_str("Dataset is missing 'size' array")
-            })?;
-            let flat = query::calculate_index(&arr, sizes).ok_or_else(|| {
-                JsValue::from_str("Invalid dimension indices")
-            })?;
+            let sizes = dataset
+                .size
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
+            let flat = query::calculate_index(&arr, sizes)
+                .ok_or_else(|| JsValue::from_str("Invalid dimension indices"))?;
             let val = values.get_at(flat);
             if want_status {
                 let st = status_at(dataset, flat);
@@ -786,11 +756,11 @@ impl JSONstat {
         // dimensions are always auto-filled and never go free.
         let query: HashMap<String, String> = serde_wasm_bindgen::from_value(dataid_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid query format: {}", e)))?;
-        let sizes = dataset.size.as_ref().ok_or_else(|| {
-            JsValue::from_str("Dataset is missing 'size' array")
-        })?;
-        let resolution = resolve_query(dataset, &query)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let sizes = dataset
+            .size
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
+        let resolution = resolve_query(dataset, &query).map_err(|e| JsValue::from_str(&e))?;
 
         match resolution {
             QueryResolution::Null => Ok(JsValue::NULL),
@@ -841,18 +811,16 @@ impl JSONstat {
     /// - `Dimension({role}, false)` → `[[...], [...]]` (one array per dim).
     /// - `Dimension()` (no id) ignores `instance`.
     #[wasm_bindgen(js_name = "Dimension")]
-    pub fn dimension(
-        &self,
-        dimid_js: JsValue,
-        instance: Option<bool>,
-    ) -> Result<JsValue, JsValue> {
+    pub fn dimension(&self, dimid_js: JsValue, instance: Option<bool>) -> Result<JsValue, JsValue> {
         let dataset = require_dataset(&self.response)?;
-        let dim_ids = dataset.id.as_ref().ok_or_else(|| {
-            JsValue::from_str("Dataset is missing 'id' array")
-        })?;
-        let dimensions = dataset.dimension.as_ref().ok_or_else(|| {
-            JsValue::from_str("Dataset is missing 'dimension' object")
-        })?;
+        let dim_ids = dataset
+            .id
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'id' array"))?;
+        let dimensions = dataset
+            .dimension
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'dimension' object"))?;
 
         let build_dim_info = |dim_id: &str, dim: &Dimension| -> serde_json::Value {
             let cat_ids = category_ids_of(dim);
@@ -866,16 +834,26 @@ impl JSONstat {
                 .collect();
 
             let mut obj = serde_json::Map::new();
-            obj.insert("class".to_string(), serde_json::Value::String("dimension".to_string()));
+            obj.insert(
+                "class".to_string(),
+                serde_json::Value::String("dimension".to_string()),
+            );
             obj.insert("id".to_string(), serde_json::to_value(&cat_ids).unwrap());
-            obj.insert("label".to_string(), serde_json::Value::String(
-                dim.label.clone().unwrap_or_else(|| dim_id.to_string()),
-            ));
-            obj.insert("length".to_string(), serde_json::Value::Number(cat_ids.len().into()));
+            obj.insert(
+                "label".to_string(),
+                serde_json::Value::String(dim.label.clone().unwrap_or_else(|| dim_id.to_string())),
+            );
+            obj.insert(
+                "length".to_string(),
+                serde_json::Value::Number(cat_ids.len().into()),
+            );
             if let Some(r) = role_val {
                 obj.insert("role".to_string(), serde_json::Value::String(r));
             }
-            obj.insert("categories".to_string(), serde_json::Value::Array(categories));
+            obj.insert(
+                "categories".to_string(),
+                serde_json::Value::Array(categories),
+            );
             if let Some(ref note) = dim.note {
                 obj.insert("note".to_string(), serde_json::to_value(note).unwrap());
             }
@@ -902,9 +880,9 @@ impl JSONstat {
             let dim_id = dim_ids.get(idx).ok_or_else(|| {
                 JsValue::from_str(&format!("Dimension index {} out of bounds", idx))
             })?;
-            let dim = dimensions.get(dim_id).ok_or_else(|| {
-                JsValue::from_str(&format!("Dimension '{}' not found", dim_id))
-            })?;
+            let dim = dimensions
+                .get(dim_id)
+                .ok_or_else(|| JsValue::from_str(&format!("Dimension '{}' not found", dim_id)))?;
             if !want_instance {
                 return to_js_value_result(&category_labels_of(dim));
             }
@@ -920,9 +898,9 @@ impl JSONstat {
 
         // Try as string ID
         if let Some(s) = dimid_js.as_string() {
-            let dim = dimensions.get(&s).ok_or_else(|| {
-                JsValue::from_str(&format!("Dimension '{}' not found", s))
-            })?;
+            let dim = dimensions
+                .get(&s)
+                .ok_or_else(|| JsValue::from_str(&format!("Dimension '{}' not found", s)))?;
             if !want_instance {
                 return to_js_value_result(&category_labels_of(dim));
             }
@@ -954,9 +932,7 @@ impl JSONstat {
             }
             let role_dims: Vec<serde_json::Value> = role_ids
                 .iter()
-                .filter_map(|id| {
-                    dimensions.get(id).map(|d| build_dim_info(id, d))
-                })
+                .filter_map(|id| dimensions.get(id).map(|d| build_dim_info(id, d)))
                 .collect();
             return to_js_value_result(&role_dims);
         }
@@ -964,10 +940,10 @@ impl JSONstat {
         Err(JsValue::from_str("Invalid dimension identifier"))
     }
 
-       // NOTE: Category() is no longer a dataset-scoped method. It now lives
-       // on the DimensionInstance returned by Dimension(id) — i.e. the toolkit
-       // anatomy `ds.Dimension(id).Category(catid)`. See `DimensionInstance`
-       // below. Category() resolution reuses the free `build_cat_info` helper.
+    // NOTE: Category() is no longer a dataset-scoped method. It now lives
+    // on the DimensionInstance returned by Dimension(id) — i.e. the toolkit
+    // anatomy `ds.Dimension(id).Category(catid)`. See `DimensionInstance`
+    // below. Category() resolution reuses the free `build_cat_info` helper.
 
     // ── Item() ────────────────────────────────────────────────────────
 
@@ -997,13 +973,19 @@ impl JSONstat {
         let build_item = |item: &CollectionItem| -> serde_json::Value {
             let mut obj = serde_json::Map::new();
             if let Some(ref class) = item.class {
-                obj.insert("class".to_string(), serde_json::Value::String(class.clone()));
+                obj.insert(
+                    "class".to_string(),
+                    serde_json::Value::String(class.clone()),
+                );
             }
             if let Some(ref href) = item.href {
                 obj.insert("href".to_string(), serde_json::Value::String(href.clone()));
             }
             if let Some(ref label) = item.label {
-                obj.insert("label".to_string(), serde_json::Value::String(label.clone()));
+                obj.insert(
+                    "label".to_string(),
+                    serde_json::Value::String(label.clone()),
+                );
             }
             if let Some(ref ext) = item.extension {
                 obj.insert("extension".to_string(), ext.clone());
@@ -1013,17 +995,16 @@ impl JSONstat {
 
         // No argument → all items
         if itemid_js.is_undefined() || itemid_js.is_null() {
-            let all: Vec<serde_json::Value> =
-                items.iter().map(&build_item).collect();
+            let all: Vec<serde_json::Value> = items.iter().map(&build_item).collect();
             return to_js_value_result(&all);
         }
 
         // Integer index
         if let Some(num) = itemid_js.as_f64() {
             let idx = index_from_f64(num).map_err(JsValue::from_str)?;
-            let item = items.get(idx).ok_or_else(|| {
-                JsValue::from_str(&format!("Item index {} out of bounds", idx))
-            })?;
+            let item = items
+                .get(idx)
+                .ok_or_else(|| JsValue::from_str(&format!("Item index {} out of bounds", idx)))?;
             return to_js_value_result(&build_item(item));
         }
 
@@ -1086,9 +1067,10 @@ impl JSONstat {
             .size
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
-        let dimensions = dataset.dimension.as_ref().ok_or_else(|| {
-            JsValue::from_str("Dataset is missing 'dimension' object")
-        })?;
+        let dimensions = dataset
+            .dimension
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'dimension' object"))?;
         let values = dataset
             .value
             .as_ref()
@@ -1170,9 +1152,10 @@ impl JSONstat {
             .size
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
-        let dimensions = dataset.dimension.as_ref().ok_or_else(|| {
-            JsValue::from_str("Dataset is missing 'dimension' object")
-        })?;
+        let dimensions = dataset
+            .dimension
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'dimension' object"))?;
         let values = dataset
             .value
             .as_ref()
@@ -1361,9 +1344,8 @@ impl JSONstat {
         // Parse options
         let mut invert = false;
         if let Some(js) = opts_js {
-            let opts: HashMap<String, serde_json::Value> =
-                serde_wasm_bindgen::from_value(js)
-                    .map_err(|e| JsValue::from_str(&format!("Invalid dice options: {}", e)))?;
+            let opts: HashMap<String, serde_json::Value> = serde_wasm_bindgen::from_value(js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid dice options: {}", e)))?;
             if let Some(serde_json::Value::Bool(b)) = opts.get("drop") {
                 invert = *b;
             }
@@ -1372,8 +1354,8 @@ impl JSONstat {
         // Parse filter
         let filter: HashMap<String, Vec<String>> = parse_dice_filter(filter_js)?;
 
-        let new_dataset = dice_dataset(dataset, &filter, invert)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let new_dataset =
+            dice_dataset(dataset, &filter, invert).map_err(|e| JsValue::from_str(&e))?;
 
         Ok(JSONstat {
             response: JsonStatResponse::Dataset(new_dataset),
@@ -1530,8 +1512,7 @@ struct ItemFilter {
 
 // ── Transform Options (deserialized from JS) ──────────────────────────────
 
-#[derive(Default)]
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TransformOpts {
     #[serde(rename = "type")]
@@ -1669,15 +1650,15 @@ fn dice_dataset(
 
 // ── Dice Filter Parsing ───────────────────────────────────────────────────
 
-fn parse_dice_filter(
-    filter_js: JsValue,
-) -> Result<HashMap<String, Vec<String>>, JsValue> {
+fn parse_dice_filter(filter_js: JsValue) -> Result<HashMap<String, Vec<String>>, JsValue> {
     if filter_js.is_null() || filter_js.is_undefined() {
         return Ok(HashMap::new());
     }
 
     // Try as object {dim_id: [cat_ids]}
-    if let Ok(map) = serde_wasm_bindgen::from_value::<HashMap<String, Vec<String>>>(filter_js.clone()) {
+    if let Ok(map) =
+        serde_wasm_bindgen::from_value::<HashMap<String, Vec<String>>>(filter_js.clone())
+    {
         return Ok(map);
     }
 
@@ -1688,8 +1669,10 @@ fn parse_dice_filter(
         let mut map = HashMap::new();
         for pair in arr {
             if pair.len() == 2 {
-                if let (Some(serde_json::Value::String(dim_id)), Some(serde_json::Value::Array(cats))) =
-                    (pair.first(), pair.get(1))
+                if let (
+                    Some(serde_json::Value::String(dim_id)),
+                    Some(serde_json::Value::Array(cats)),
+                ) = (pair.first(), pair.get(1))
                 {
                     let cat_ids: Vec<String> = cats
                         .iter()
@@ -1744,7 +1727,11 @@ fn precompute_columns(
                         .collect()
                 })
                 .unwrap_or_default();
-            DimColumn { dim_idx, name, cells }
+            DimColumn {
+                dim_idx,
+                name,
+                cells,
+            }
         })
         .collect()
 }
@@ -1839,9 +1826,9 @@ fn transform_arrobj_by(
 ) -> Result<serde_json::Value, JsValue> {
     // Get by-dimension categories and column names
     let by_dim_id = &dim_ids[by_dim_idx];
-    let by_dim = dimensions.get(by_dim_id).ok_or_else(|| {
-        JsValue::from_str(&format!("Dimension '{}' not found", by_dim_id))
-    })?;
+    let by_dim = dimensions
+        .get(by_dim_id)
+        .ok_or_else(|| JsValue::from_str(&format!("Dimension '{}' not found", by_dim_id)))?;
     let by_cat_ids = category_ids_of(by_dim);
     let by_col_names: Vec<String> = by_cat_ids
         .iter()
@@ -2029,9 +2016,9 @@ fn transform_objarr_by(
     prefix: &str,
 ) -> Result<serde_json::Value, JsValue> {
     let by_dim_id = &dim_ids[by_dim_idx];
-    let by_dim = dimensions.get(by_dim_id).ok_or_else(|| {
-        JsValue::from_str(&format!("Dimension '{}' not found", by_dim_id))
-    })?;
+    let by_dim = dimensions
+        .get(by_dim_id)
+        .ok_or_else(|| JsValue::from_str(&format!("Dimension '{}' not found", by_dim_id)))?;
     let by_cat_ids = category_ids_of(by_dim);
     let by_col_names: Vec<String> = by_cat_ids
         .iter()
@@ -2502,9 +2489,18 @@ mod tests {
             JsonStatResponse::Dataset(d) => d,
             _ => panic!("Expected dataset"),
         };
-        assert_eq!(status_at(dataset, 0), serde_json::Value::String("ok".to_string()));
-        assert_eq!(status_at(dataset, 1), serde_json::Value::String("est".to_string()));
-        assert_eq!(status_at(dataset, 2), serde_json::Value::String("ok".to_string()));
+        assert_eq!(
+            status_at(dataset, 0),
+            serde_json::Value::String("ok".to_string())
+        );
+        assert_eq!(
+            status_at(dataset, 1),
+            serde_json::Value::String("est".to_string())
+        );
+        assert_eq!(
+            status_at(dataset, 2),
+            serde_json::Value::String("ok".to_string())
+        );
     }
 
     #[test]
@@ -2549,8 +2545,14 @@ mod tests {
             _ => panic!("Expected dataset"),
         };
         // A plain string status applies to all values
-        assert_eq!(status_at(dataset, 0), serde_json::Value::String("e".to_string()));
-        assert_eq!(status_at(dataset, 1), serde_json::Value::String("e".to_string()));
+        assert_eq!(
+            status_at(dataset, 0),
+            serde_json::Value::String("e".to_string())
+        );
+        assert_eq!(
+            status_at(dataset, 1),
+            serde_json::Value::String("e".to_string())
+        );
     }
 
     #[test]
@@ -2695,7 +2697,10 @@ mod tests {
             _ => panic!("Expected dataset"),
         };
         // sizes: [1, 2, 2] → n = 4
-        assert_eq!(dataset.size.as_ref().map(|s| s.iter().product::<usize>()), Some(4));
+        assert_eq!(
+            dataset.size.as_ref().map(|s| s.iter().product::<usize>()),
+            Some(4)
+        );
     }
 
     #[test]
@@ -2839,18 +2844,18 @@ mod tests {
         );
 
         // Round-trip: serialization must also preserve this order.
-        let roundtrip = serde_json::to_string(
-            &Dataset {
-                dimension: Some(dimensions.clone()),
-                ..serde_json::from_str::<Dataset>(json).unwrap()
-            },
-        )
+        let roundtrip = serde_json::to_string(&Dataset {
+            dimension: Some(dimensions.clone()),
+            ..serde_json::from_str::<Dataset>(json).unwrap()
+        })
         .unwrap();
         let zebra_pos = roundtrip.find("\"zebra\"").unwrap();
         let alpha_pos = roundtrip.find("\"alpha\"").unwrap();
         let mike_pos = roundtrip.find("\"mike\"").unwrap();
-        assert!(zebra_pos < alpha_pos && alpha_pos < mike_pos,
-            "serialization order must match insertion order");
+        assert!(
+            zebra_pos < alpha_pos && alpha_pos < mike_pos,
+            "serialization order must match insertion order"
+        );
     }
 
     // ── Data() partial queries ───────────────────────────────────────────
@@ -2915,7 +2920,9 @@ mod tests {
         query.insert("area".to_string(), "ZZ".to_string());
         query.insert("year".to_string(), "2020".to_string());
         match resolve_query(&dataset, &query).unwrap() {
-            QueryResolution::Slice { free_cat_indices, .. } => {
+            QueryResolution::Slice {
+                free_cat_indices, ..
+            } => {
                 assert_eq!(free_cat_indices, vec![0, 1])
             }
             other => panic!("Expected Slice, got {:?}", other),
@@ -2977,8 +2984,7 @@ mod tests {
         let included: Vec<usize> = (0..dim_ids.len()).collect();
 
         let result = transform_object(
-            &d, dim_ids, sizes, dims, values, &included, false, "label", "id",
-            "Value", "Status",
+            &d, dim_ids, sizes, dims, values, &included, false, "label", "id", "Value", "Status",
         )
         .unwrap();
 
@@ -3006,8 +3012,7 @@ mod tests {
         let included: Vec<usize> = (0..dim_ids.len()).collect();
 
         let result = transform_object(
-            &d, dim_ids, sizes, dims, values, &included, false, "label", "id",
-            "Value", "Status",
+            &d, dim_ids, sizes, dims, values, &included, false, "label", "id", "Value", "Status",
         )
         .unwrap();
 
@@ -3039,8 +3044,8 @@ mod tests {
         let included: Vec<usize> = (0..dim_ids.len()).collect();
 
         let result = transform_arrobj(
-            &d, dim_ids, sizes, dims, values, &included, false, "label", "id",
-            "Value", "Status", true,
+            &d, dim_ids, sizes, dims, values, &included, false, "label", "id", "Value", "Status",
+            true,
         )
         .unwrap();
         let first = result.as_array().unwrap().first().unwrap();
@@ -3059,11 +3064,16 @@ mod tests {
         let included: Vec<usize> = (0..dim_ids.len()).collect();
 
         let result = transform_arrobj_by(
-            &d, dim_ids, sizes, dims, values, &included, 1, "id", "id", "", false,
-            "y_",
+            &d, dim_ids, sizes, dims, values, &included, 1, "id", "id", "", false, "y_",
         )
         .unwrap();
-        let first = result.as_array().unwrap().first().unwrap().as_object().unwrap();
+        let first = result
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()
+            .as_object()
+            .unwrap();
         // The by-dimension (area, index 1) categories get prefixed column names.
         let has_prefixed = first.keys().any(|k| k.starts_with("y_"));
         assert!(has_prefixed, "expected prefixed column names");
@@ -3073,7 +3083,16 @@ mod tests {
     fn test_build_meta_structure() {
         let d = transform_dataset();
         let dim_ids = d.id.as_ref().unwrap();
-        let meta = build_meta(&d, dim_ids, "arrobj", false, Some("area"), &["year".to_string()], "", false);
+        let meta = build_meta(
+            &d,
+            dim_ids,
+            "arrobj",
+            false,
+            Some("area"),
+            &["year".to_string()],
+            "",
+            false,
+        );
         assert_eq!(meta.get("type").unwrap(), "arrobj");
         assert_eq!(meta.get("status").unwrap(), false);
         assert_eq!(meta.get("by").unwrap(), "area");

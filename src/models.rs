@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ── JsonStatResponse with class-based discrimination ──────────────────────
 
@@ -167,14 +167,12 @@ impl Dimension {
             // Filter index
             if let Some(ref index) = category.index {
                 category.index = Some(match index {
-                    CategoryIndex::Array(arr) => {
-                        CategoryIndex::Array(
-                            arr.iter()
-                                .filter(|id| kept_cat_ids.contains(id))
-                                .cloned()
-                                .collect(),
-                        )
-                    }
+                    CategoryIndex::Array(arr) => CategoryIndex::Array(
+                        arr.iter()
+                            .filter(|id| kept_cat_ids.contains(id))
+                            .cloned()
+                            .collect(),
+                    ),
                     CategoryIndex::Map(map) => {
                         let mut kept: Vec<(&String, &usize)> = map
                             .iter()
