@@ -1,0 +1,91 @@
+# Continuous integration for jsonstat-wasm.
+#
+# Runs on every push to main and every pull request, as well as on manual
+# dispatch. The pipeline is the single source of truth for "does this build
+# ship": formatting, linting, the unit-test suite, the wasm-pack build, and a
+# type-check of the generated bindings.
+#
+# Every step below was validated locally before this file was committed; the
+# commands here mirror `scripts/build.sh` and the documented dev workflow
+# exactly so local and remote stay in sync.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel any superseded run on the same ref so force-pushes and rapid PR
+# updates don't waste runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: Build & verify
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Stable toolchain with the two extra pieces this crate needs:
+      #   - rustfmt + clippy for the format/lint gates
+      #   - wasm32-unknown-unknown for the WebAssembly target
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      # Cache the cargo registry + build artifacts. Keyed on Cargo.lock so a
+      # dependency bump invalidates cleanly.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binary; far faster than `cargo install wasm-pack`.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.5.0
+        with:
+          version: "0.13.1"
+
+      # ── Gate 1: formatting ───────────────────────────────────────────────
+      # Enforces `cargo fmt`. A diff here means someone forgot to run
+      # rustfmt; fail fast rather than review nitpicks.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # ── Gate 2: clippy with warnings as errors ───────────────────────────
+      # Lint against the actual WASM target so wasm-only code paths are
+      # analyzed the same way `scripts/build.sh` compiles them.
+      - name: Clippy
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+      # ── Gate 3: unit tests (native host target) ──────────────────────────
+      # The #[cfg(test)] modules in src/ run on the host, not in a browser, so
+      # a plain `cargo test` is correct here.
+      - name: Run tests
+        run: cargo test
+
+      # ── Gate 4: wasm-pack build ──────────────────────────────────────────
+      # Reproduces the exact published artifact: wasm-pack build + facade copy
+      # + package.json patch (see scripts/build.sh).
+      - name: Build WASM package
+        run: bash scripts/build.sh
+
+      # ── Gate 5: type-check generated bindings ────────────────────────────
+      # tsconfig.json checks pkg/**/*.d.ts, so this MUST run after the build.
+      # TypeScript is pulled in via npx — no package.json dependency needed.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Type-check bindings
+        run: npx --yes -p typescript@5 tsc --noEmit
