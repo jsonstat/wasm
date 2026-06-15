@@ -49,11 +49,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Prebuilt binary; far faster than `cargo install wasm-pack`.
+      # Official installer (rustwasm.github.io). Prebuilt binary — far faster
+      # than `cargo install wasm-pack` — and version-pinned to match the local
+      # toolchain that produced the shipped build. Preferred over the
+      # unmaintained jetli/wasm-pack-action (which still runs on Node 16).
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.5.0
-        with:
-          version: "0.13.1"
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -f --version 0.13.1
 
       # ── Gate 1: formatting ───────────────────────────────────────────────
       # Enforces `cargo fmt`. A diff here means someone forgot to run
