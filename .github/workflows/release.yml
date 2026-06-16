@@ -4,8 +4,11 @@
 # the package exactly like CI, verifies the tag matches Cargo.toml, publishes
 # the patched pkg/ to npm, and creates the GitHub Release.
 #
-# Required repository secret:
-#   NPM_TOKEN — an npm automation token with publish rights to `jsonstat-wasm`.
+# Authentication: npm Trusted Publishing (OIDC). No long-lived NPM_TOKEN secret
+# is used — npm mints a short-lived credential per run from the `id-token`
+# below, which also makes provenance automatic. This requires a Trusted
+# Publisher to be configured on the npm package pointing at this workflow
+# (npm package → Settings → Trusted Publishing). See docs/INSTALL.md.
 name: Release
 
 on:
@@ -15,7 +18,7 @@ on:
 
 permissions:
   contents: write # create the GitHub Release
-  id-token: write # npm provenance (--provenance) attestation
+  id-token: write # npm Trusted Publishing (OIDC) + provenance attestation
 
 concurrency:
   group: release-${{ github.ref }}
@@ -75,10 +78,16 @@ jobs:
       - name: Type-check bindings
         run: npx --yes -p typescript@5 tsc --noEmit
 
+      # Trusted Publishing (OIDC) requires a recent npm CLI; Node 20 ships
+      # npm 10, which predates it. Upgrade before publishing.
+      - name: Upgrade npm for Trusted Publishing
+        run: npm install -g npm@latest
+
+      # No NODE_AUTH_TOKEN: auth comes from the OIDC id-token. Provenance is
+      # generated automatically under Trusted Publishing; --provenance is kept
+      # explicit for clarity.
       - name: Publish to npm
         run: npm publish ./pkg --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # ── GitHub Release ───────────────────────────────────────────────────
       - name: Create GitHub Release

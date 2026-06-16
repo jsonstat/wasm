@@ -263,19 +263,28 @@ rebuilds the package, verifies the tag matches `Cargo.toml`, runs the test and
 type-check gates, **publishes the patched `pkg/` to npm**, and **creates the
 GitHub Release**.
 
-### One-time setup
+### One-time setup (npm Trusted Publishing)
 
-Add an npm **automation** access token as a repository secret so the workflow
-can publish:
+The workflow authenticates to npm via **[Trusted Publishing](https://docs.npmjs.com/trusted-publishers)**
+(OIDC) — there is **no `NPM_TOKEN` secret**. npm mints a short-lived credential
+per run from the workflow's `id-token`, which also makes
+[provenance](https://docs.npmjs.com/generating-provenance-statements) automatic.
 
-1. Create the token at npm → **Account → Access Tokens → Generate New Token →
-   Automation** (it needs publish rights to `jsonstat-wasm`).
-2. In GitHub: **Settings → Secrets and variables → Actions → New repository
-   secret**, name it `NPM_TOKEN`, and paste the token.
+Configure the trusted publisher once:
 
-> The workflow publishes with [npm provenance](https://docs.npmjs.com/generating-provenance-statements)
-> (`--provenance`), which relies on the `id-token: write` permission already
-> declared in the workflow. Drop the `--provenance` flag if you don't want it.
+1. On npm, go to the **`jsonstat-wasm` package → Settings → Trusted Publishing**.
+2. Add a **GitHub Actions** publisher with:
+   - **Organization / user:** `jsonstat`
+   - **Repository:** `wasm`
+   - **Workflow filename:** `release.yml`
+   - **Environment:** *(leave blank)*
+
+That's it — no secret to store or rotate. The publishing account must already
+own/maintain `jsonstat-wasm` to add the trusted publisher.
+
+> The workflow upgrades npm (`npm install -g npm@latest`) before publishing
+> because Trusted Publishing requires a recent npm CLI that the bundled Node 20
+> npm predates.
 
 ### Cutting a release
 
