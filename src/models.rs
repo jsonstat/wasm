@@ -41,7 +41,42 @@ impl<'de> serde::Deserialize<'de> for JsonStatResponse {
     }
 }
 
+/// Minimal probe used to detect the `class` discriminator without
+/// materializing the whole document into a `serde_json::Value`.
+#[derive(Deserialize)]
+struct ClassProbe {
+    class: Option<String>,
+}
+
 impl JsonStatResponse {
+    /// Parse a JSON-stat document directly into the typed model.
+    ///
+    /// This avoids the double parse of the generic `Deserialize` impl (which
+    /// first builds a full `serde_json::Value` tree, then re-walks it with
+    /// `from_value`). Here we do one cheap, allocation-light structural scan to
+    /// read `class`, then a single real deserialization straight into the
+    /// concrete type.
+    pub fn from_json_str(json_str: &str) -> Result<Self, serde_json::Error> {
+        let class = serde_json::from_str::<ClassProbe>(json_str)
+            .ok()
+            .and_then(|p| p.class)
+            .unwrap_or_else(|| "dataset".to_string());
+
+        match class.as_str() {
+            "dataset" => serde_json::from_str::<Dataset>(json_str).map(JsonStatResponse::Dataset),
+            "dimension" => {
+                serde_json::from_str::<DimensionResponse>(json_str).map(JsonStatResponse::Dimension)
+            }
+            "collection" => {
+                serde_json::from_str::<Collection>(json_str).map(JsonStatResponse::Collection)
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "Unknown class: '{}'",
+                other
+            ))),
+        }
+    }
+
     pub fn version(&self) -> &str {
         match self {
             Self::Dataset(d) => &d.version,

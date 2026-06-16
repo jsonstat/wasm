@@ -1,6 +1,6 @@
 [package]
 name = "jsonstat-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A fast JSON-stat 2.0 parser compiled to WebAssembly"
 repository = "https://github.com/jsonstat/wasm"
@@ -10,14 +10,32 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-bindgen = "0.2.92"
+wasm-bindgen = "0.2.125"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 console_error_panic_hook = "0.1.7"
 serde-wasm-bindgen = "0.6.5"
-js-sys = "0.3.100"
+js-sys = "0.3.102"
 # Preserves insertion order for the `dimension` map so ToJSON() emits
 # dimensions in the same order as the source document. Already resolved
 # transitively via serde_json's `preserve_order` feature; declared directly
 # here to use IndexMap in our own model types.
 indexmap = { version = "2", features = ["serde"] }
+
+# Release profile tuned for WebAssembly: smaller binary and faster runtime.
+# `lto` + `codegen-units = 1` improve both speed and size; `opt-level = "s"`,
+# `strip` and `panic = "abort"` further shrink the `.wasm`. wasm-pack still
+# runs `wasm-opt` on top of this.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# wasm-opt settings for `wasm-pack build --release`. Current rustc emits the
+# `bulk-memory` and `nontrapping-float-to-int` WASM features by default, which
+# older bundled `wasm-opt` versions reject unless explicitly enabled. We keep
+# `-O` (size/speed optimization) and enable those features so wasm-opt runs.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int']

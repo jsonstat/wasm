@@ -31,22 +31,26 @@ pub struct JSONstat {
 
 // ── Private Helpers ───────────────────────────────────────────────────────
 
-/// Convert a serializable value to a JsValue via JSON string round-trip.
-/// This avoids serde_wasm_bindgen::to_value() which doesn't correctly
-/// convert nested serde_json::Value objects (arrays/objects come through
-/// as undefined in JS).
+/// Serializer used for every value crossing the WASM→JS boundary.
+///
+/// `serialize_maps_as_objects(true)` makes Rust maps (and `serde_json::Value`
+/// objects) come through as **plain JS objects** rather than `Map`s — which is
+/// what callers expect (e.g. `data.value`). Serializing directly to `JsValue`
+/// avoids the previous `serde_json::to_string` + `js_sys::JSON::parse` round
+/// trip, which doubled the work on the hot output path.
+fn boundary_serializer() -> serde_wasm_bindgen::Serializer {
+    serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true)
+}
+
+/// Convert a serializable value to a JsValue. Returns `JsValue::NULL` on error.
 fn to_js_value<T: serde::Serialize>(val: &T) -> JsValue {
-    match serde_json::to_string(val) {
-        Ok(s) => js_sys::JSON::parse(&s).unwrap_or(JsValue::NULL),
-        Err(_) => JsValue::NULL,
-    }
+    val.serialize(&boundary_serializer()).unwrap_or(JsValue::NULL)
 }
 
 /// Like `to_js_value` but returns a Result for methods that need error propagation.
 fn to_js_value_result<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> {
-    let s = serde_json::to_string(val)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
-    js_sys::JSON::parse(&s).map_err(|e| JsValue::from_str(&format!("JSON parse error: {:?}", e)))
+    val.serialize(&boundary_serializer())
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
 /// Extract a dataset reference from the response, or error.
@@ -131,6 +135,22 @@ fn category_ids_of(dim: &Dimension) -> Vec<String> {
     }
 }
 
+/// Number of categories in a dimension, without allocating the id vector.
+fn category_len(dim: &Dimension) -> usize {
+    let Some(category) = dim.category.as_ref() else {
+        return 0;
+    };
+    match category.index.as_ref() {
+        Some(index) => index.len(),
+        None => category
+            .label
+            .as_ref()
+            .filter(|l| l.len() == 1)
+            .map(|l| l.len())
+            .unwrap_or(0),
+    }
+}
+
 /// Get the category label for a given category ID in a dimension.
 fn category_label_for(dim: &Dimension, cat_id: &str) -> String {
     dim.category
@@ -152,7 +172,7 @@ fn dimension_label_or(dim: &Dimension, fallback: &str) -> String {
 fn resolve_role(dataset: &Dataset, dim_id: &str) -> Option<String> {
     dataset.role.as_ref().and_then(|roles| {
         for (role_name, ids) in roles {
-            if ids.contains(&dim_id.to_string()) {
+            if ids.iter().any(|id| id == dim_id) {
                 return Some(role_name.clone());
             }
         }
@@ -400,7 +420,7 @@ impl JSONstat {
     /// Parses a JSON-stat string into a WebAssembly-managed object.
     #[wasm_bindgen(constructor)]
     pub fn new(json_str: &str) -> Result<JSONstat, JsValue> {
-        let response: JsonStatResponse = serde_json::from_str(json_str)
+        let response = JsonStatResponse::from_json_str(json_str)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse JSON-stat: {}", e)))?;
         Ok(JSONstat { response })
     }
@@ -1419,7 +1439,7 @@ impl DimensionInstance {
     /// Number of categories.
     #[wasm_bindgen(getter)]
     pub fn length(&self) -> usize {
-        category_ids_of(&self.dim).len()
+        category_len(&self.dim)
     }
 
     /// Role (time/geo/metric/classification), if any.
@@ -1581,9 +1601,16 @@ fn dice_dataset(
         }
 
         if let Some(filtered_cats) = filter.get(dim_id) {
+            // Build O(1)-lookup sets once to avoid O(n*m) `Vec::contains`
+            // scans inside the validation and selection loops below.
+            let all_set: std::collections::HashSet<&str> =
+                all_cat_ids.iter().map(String::as_str).collect();
+            let filter_set: std::collections::HashSet<&str> =
+                filtered_cats.iter().map(String::as_str).collect();
+
             // Validate that every filter category exists
             for cat_id in filtered_cats {
-                if !all_cat_ids.contains(cat_id) {
+                if !all_set.contains(cat_id.as_str()) {
                     return Err(format!(
                         "Category '{}' not found in dimension '{}'",
                         cat_id, dim_id
@@ -1593,7 +1620,7 @@ fn dice_dataset(
             let kept: Vec<usize> = all_cat_ids
                 .iter()
                 .enumerate()
-                .filter(|(_, id)| filtered_cats.contains(id) != invert)
+                .filter(|(_, id)| filter_set.contains(id.as_str()) != invert)
                 .map(|(pos, _)| pos)
                 .collect();
             keep_indices.push(kept);

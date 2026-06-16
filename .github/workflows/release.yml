@@ -1,0 +1,87 @@
+# Release pipeline for jsonstat-wasm.
+#
+# Triggered when a `v*` tag is pushed (e.g. by scripts/release.sh). It rebuilds
+# the package exactly like CI, verifies the tag matches Cargo.toml, publishes
+# the patched pkg/ to npm, and creates the GitHub Release.
+#
+# Required repository secret:
+#   NPM_TOKEN — an npm automation token with publish rights to `jsonstat-wasm`.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # npm provenance (--provenance) attestation
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, publish & release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -f --version 0.13.1
+
+      # ── Verify the tag matches the crate version ─────────────────────────
+      # Guards against a tag like v0.1.2 pointing at a commit whose Cargo.toml
+      # still says 0.1.1 (which would publish the wrong version).
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml: ${CARGO_VERSION}    tag: ${TAG_VERSION}"
+          if [[ "${CARGO_VERSION}" != "${TAG_VERSION}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+
+      # ── Verification gates (mirror ci.yml) ───────────────────────────────
+      - name: Run tests
+        run: cargo test
+
+      - name: Build WASM package
+        run: bash scripts/build.sh
+
+      # ── Publish to npm ───────────────────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Type-check bindings
+        run: npx --yes -p typescript@5 tsc --noEmit
+
+      - name: Publish to npm
+        run: npm publish ./pkg --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # ── GitHub Release ───────────────────────────────────────────────────
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
