@@ -44,7 +44,8 @@ fn boundary_serializer() -> serde_wasm_bindgen::Serializer {
 
 /// Convert a serializable value to a JsValue. Returns `JsValue::NULL` on error.
 fn to_js_value<T: serde::Serialize>(val: &T) -> JsValue {
-    val.serialize(&boundary_serializer()).unwrap_or(JsValue::NULL)
+    val.serialize(&boundary_serializer())
+        .unwrap_or(JsValue::NULL)
 }
 
 /// Like `to_js_value` but returns a Result for methods that need error propagation.
