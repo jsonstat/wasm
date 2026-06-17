@@ -90,7 +90,17 @@ jobs:
         run: npm publish ./pkg --access public --provenance
 
       # ── GitHub Release ───────────────────────────────────────────────────
+      # Use hand-written notes from docs/releases/<tag>.md when present;
+      # otherwise fall back to auto-generated notes from commit/PR history.
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+        run: |
+          NOTES_FILE="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ -f "${NOTES_FILE}" ]]; then
+            echo "Using release notes from ${NOTES_FILE}"
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file "${NOTES_FILE}"
+          else
+            echo "No notes file at ${NOTES_FILE}; auto-generating notes"
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi

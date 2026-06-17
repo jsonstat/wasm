@@ -1,6 +1,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 
 // ── JsonStatResponse with class-based discrimination ──────────────────────
 
@@ -41,11 +43,51 @@ impl<'de> serde::Deserialize<'de> for JsonStatResponse {
     }
 }
 
-/// Minimal probe used to detect the `class` discriminator without
-/// materializing the whole document into a `serde_json::Value`.
-#[derive(Deserialize)]
-struct ClassProbe {
-    class: Option<String>,
+/// Sentinel that brackets the detected class in [`ClassFinder`]'s signalling
+/// error. Uses control characters that never appear in a JSON-stat `class`
+/// value (`"dataset"`/`"dimension"`/`"collection"`), so extraction is
+/// unambiguous even if a deserializer appends extra text to the message.
+const CLASS_SENTINEL: &str = "\u{1}jsonstat_class\u{1}";
+
+/// Visitor that reads only the top-level `class` field and **stops early**.
+///
+/// A `#[derive(Deserialize)]` probe struct must visit every top-level entry —
+/// skipping unknown fields still lexes the entire document, including the
+/// potentially huge `value` array. To truly short-circuit, this visitor signals
+/// success by *returning an error* the moment it sees `"class"`: serde_json
+/// then stops parsing immediately and never lexes the trailing fields (the
+/// common layout has `class` before `value`). `from_json_str` decodes that
+/// sentinel error back into the class string.
+///
+/// Keys are read as `Cow<str>` so simple keys borrow with zero allocation and
+/// escaped keys still deserialize correctly. Non-`class` values are skipped via
+/// `IgnoredAny` (structural skip, no typed materialization).
+struct ClassFinder;
+
+impl<'de> serde::de::Visitor<'de> for ClassFinder {
+    /// Returned only when no `class` key exists; the found case exits via error.
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON-stat object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error as _;
+        while let Some(key) = map.next_key::<Cow<str>>()? {
+            if key == "class" {
+                let class: String = map.next_value()?;
+                return Err(A::Error::custom(format!(
+                    "{CLASS_SENTINEL}{class}{CLASS_SENTINEL}"
+                )));
+            }
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(())
+    }
 }
 
 impl JsonStatResponse {
@@ -53,14 +95,27 @@ impl JsonStatResponse {
     ///
     /// This avoids the double parse of the generic `Deserialize` impl (which
     /// first builds a full `serde_json::Value` tree, then re-walks it with
-    /// `from_value`). Here we do one cheap, allocation-light structural scan to
+    /// `from_value`). Here we do one cheap, early-exiting structural scan to
     /// read `class`, then a single real deserialization straight into the
     /// concrete type.
     pub fn from_json_str(json_str: &str) -> Result<Self, serde_json::Error> {
-        let class = serde_json::from_str::<ClassProbe>(json_str)
-            .ok()
-            .and_then(|p| p.class)
-            .unwrap_or_else(|| "dataset".to_string());
+        // Cheap class probe: short-circuits as soon as `class` is found via a
+        // sentinel error. Missing `class`, a non-object, or malformed JSON all
+        // fall back to "dataset"; the real parse below surfaces the precise
+        // error in those cases.
+        let class = {
+            use serde::Deserializer as _;
+            let mut de = serde_json::Deserializer::from_str(json_str);
+            match de.deserialize_map(ClassFinder) {
+                Ok(()) => "dataset".to_string(),
+                Err(e) => e
+                    .to_string()
+                    .split(CLASS_SENTINEL)
+                    .nth(1)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "dataset".to_string()),
+            }
+        };
 
         match class.as_str() {
             "dataset" => serde_json::from_str::<Dataset>(json_str).map(JsonStatResponse::Dataset),
@@ -162,7 +217,13 @@ impl DatasetValue {
     pub fn get_at(&self, index: usize) -> Cell {
         match self {
             Self::Array(arr) => arr.get(index).cloned().unwrap_or(Cell::Null),
-            Self::Map(map) => map.get(&index.to_string()).cloned().unwrap_or(Cell::Null),
+            Self::Map(map) => {
+                // Allocation-free decimal key lookup (sparse value object).
+                let mut buf = [0u8; 20];
+                map.get(crate::query::usize_key(&mut buf, index))
+                    .cloned()
+                    .unwrap_or(Cell::Null)
+            }
         }
     }
 }

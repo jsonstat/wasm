@@ -54,6 +54,18 @@ fn to_js_value_result<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> 
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
+/// A `{value, status}` pair as returned by `Data()`.
+///
+/// Serializing this struct uses the `&'static str` field names `"value"` and
+/// `"status"`, so the hot `Data()` loops avoid the two per-cell `String` key
+/// allocations the `serde_json::json!({ "value": .., "status": .. })` macro
+/// would otherwise perform. The emitted JS object shape is identical.
+#[derive(serde::Serialize)]
+struct DataPoint {
+    value: Cell,
+    status: serde_json::Value,
+}
+
 /// Extract a dataset reference from the response, or error.
 fn require_dataset(resp: &JsonStatResponse) -> Result<&Dataset, JsValue> {
     match resp {
@@ -221,10 +233,13 @@ fn status_at(dataset: &Dataset, flat: usize) -> serde_json::Value {
         Some(serde_json::Value::Array(arr)) => {
             arr.get(flat).cloned().unwrap_or(serde_json::Value::Null)
         }
-        Some(serde_json::Value::Object(map)) => map
-            .get(&flat.to_string())
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
+        Some(serde_json::Value::Object(map)) => {
+            // Allocation-free decimal key lookup (sparse status object).
+            let mut buf = [0u8; 20];
+            map.get(query::usize_key(&mut buf, flat))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
         // A plain string applies to all values (JSON-stat 2.0)
         Some(serde_json::Value::String(s)) => serde_json::Value::String(s.clone()),
         _ => serde_json::Value::Null,
@@ -699,20 +714,22 @@ impl JSONstat {
                 .as_ref()
                 .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
             let total: usize = sizes.iter().product();
-            let mut result = Vec::with_capacity(total);
-            for i in 0..total {
-                let val = values.get_at(i);
-                if want_status {
-                    let st = status_at(dataset, i);
-                    result.push(serde_json::json!({
-                        "value": val,
-                        "status": st
-                    }));
-                } else {
-                    result.push(serde_json::json!(val));
+            if want_status {
+                let mut result = Vec::with_capacity(total);
+                for i in 0..total {
+                    result.push(DataPoint {
+                        value: values.get_at(i),
+                        status: status_at(dataset, i),
+                    });
                 }
+                return to_js_value_result(&result);
+            } else {
+                let mut result = Vec::with_capacity(total);
+                for i in 0..total {
+                    result.push(values.get_at(i));
+                }
+                return to_js_value_result(&result);
             }
-            return to_js_value_result(&result);
         }
 
         // Try as integer (flat index)
@@ -799,21 +816,31 @@ impl JSONstat {
                 mut fixed,
                 free_cat_indices,
             } => {
-                let mut out = Vec::with_capacity(free_cat_indices.len());
-                for ci in free_cat_indices {
-                    fixed[free_dim_idx] = ci;
-                    let flat = query::calculate_index(&fixed, sizes).ok_or_else(|| {
+                let flat_at = |fixed: &[usize]| {
+                    query::calculate_index(fixed, sizes).ok_or_else(|| {
                         JsValue::from_str("Failed to calculate row-major order index")
-                    })?;
-                    let val = values.get_at(flat);
-                    if want_status {
-                        let st = status_at(dataset, flat);
-                        out.push(serde_json::json!({ "value": val, "status": st }));
-                    } else {
-                        out.push(serde_json::json!(val));
+                    })
+                };
+                if want_status {
+                    let mut out = Vec::with_capacity(free_cat_indices.len());
+                    for ci in free_cat_indices {
+                        fixed[free_dim_idx] = ci;
+                        let flat = flat_at(&fixed)?;
+                        out.push(DataPoint {
+                            value: values.get_at(flat),
+                            status: status_at(dataset, flat),
+                        });
                     }
+                    to_js_value_result(&out)
+                } else {
+                    let mut out = Vec::with_capacity(free_cat_indices.len());
+                    for ci in free_cat_indices {
+                        fixed[free_dim_idx] = ci;
+                        let flat = flat_at(&fixed)?;
+                        out.push(values.get_at(flat));
+                    }
+                    to_js_value_result(&out)
                 }
-                to_js_value_result(&out)
             }
         }
     }
@@ -1114,7 +1141,10 @@ impl JSONstat {
 
         let row = js_sys::Array::new();
 
-        for (n, indices) in query::index_iter(sizes).enumerate() {
+        let mut odo = query::Odometer::new(sizes);
+        let mut n = 0usize;
+        while !odo.done() {
+            let indices = odo.current();
             // Build coordinates object
             let mut coords = serde_json::Map::new();
             for (dim_idx, cat_pos) in indices.iter().enumerate() {
@@ -1144,6 +1174,8 @@ impl JSONstat {
             if !result.is_undefined() {
                 row.push(&result);
             }
+            odo.advance();
+            n += 1;
         }
 
         Ok(row.into())
@@ -1631,47 +1663,82 @@ fn dice_dataset(
         }
     }
 
-    // Build the new value array by iterating over kept combinations
-    let all_combos = query::all_combinations(&keep_indices);
-    let mut new_values = Vec::with_capacity(all_combos.len());
-    let mut new_status = Vec::new();
+    // Build the new value array by walking the kept combinations with an
+    // allocation-free odometer over the *counts* of each kept category list.
+    // The flat (row-major) index of each kept cell is computed incrementally
+    // from precomputed strides — no `Vec<Vec<usize>>` materialization of the
+    // entire kept space (the previous `all_combinations` call) and no per-cell
+    // allocation.
+    let kept_counts: Vec<usize> = keep_indices.iter().map(|k| k.len()).collect();
+    let strides = query::strides(sizes);
+    let total: usize = kept_counts.iter().product();
+
     let has_status = dataset.status.is_some();
+    let mut new_values = Vec::with_capacity(total);
+    let mut new_status: Vec<serde_json::Value> = Vec::new();
     if has_status {
-        new_status.reserve(all_combos.len());
+        new_status.reserve(total);
     }
 
-    for combo in &all_combos {
-        let flat = query::calculate_index(combo, sizes)
-            .ok_or_else(|| "Failed to calculate row-major order index".to_string())?;
+    let mut odo = query::Odometer::new(&kept_counts);
+    while !odo.done() {
+        let sel = odo.current();
+        // Map each selected position back to its original category index and
+        // accumulate the flat index via strides.
+        let mut flat = 0usize;
+        for (d, &pos) in sel.iter().enumerate() {
+            flat += keep_indices[d][pos] * strides[d];
+        }
         new_values.push(values.get_at(flat));
         if has_status {
             new_status.push(status_at(dataset, flat));
         }
+        odo.advance();
     }
 
     // Build new sizes
-    let new_sizes: Vec<usize> = keep_indices.iter().map(|k| k.len()).collect();
+    let new_sizes: Vec<usize> = kept_counts;
 
-    // Build new dimensions (filter categories)
-    let mut new_dimensions = dimensions.clone();
+    // Build new dimensions (filter categories). Construct a fresh map so each
+    // surviving dimension is cloned exactly once (inside `filter_categories`)
+    // instead of cloning the whole map and then re-cloning each dimension.
+    let mut new_dimensions: indexmap::IndexMap<String, Dimension> =
+        indexmap::IndexMap::with_capacity(dim_ids.len());
     for (i, dim_id) in dim_ids.iter().enumerate() {
-        if let Some(dim) = new_dimensions.get_mut(dim_id) {
+        if let Some(dim) = dimensions.get(dim_id) {
             let kept_cat_ids: Vec<String> = keep_indices[i]
                 .iter()
                 .filter_map(|&pos| category_id_at(dim, pos))
                 .collect();
-            *dim = dim.filter_categories(&kept_cat_ids);
+            new_dimensions.insert(dim_id.clone(), dim.filter_categories(&kept_cat_ids));
         }
     }
 
-    // Build new dataset
-    let mut new_dataset = dataset.clone();
-    new_dataset.size = Some(new_sizes);
-    new_dataset.dimension = Some(new_dimensions);
-    new_dataset.value = Some(DatasetValue::Array(new_values));
-    if has_status {
-        new_dataset.status = Some(serde_json::Value::Array(new_status));
-    }
+    // Build new dataset. Only metadata is cloned; the original (potentially
+    // huge) `value`/`status` arrays are NOT cloned — they are replaced by the
+    // freshly built subsets above.
+    let new_dataset = Dataset {
+        version: dataset.version.clone(),
+        class: dataset.class.clone(),
+        label: dataset.label.clone(),
+        source: dataset.source.clone(),
+        updated: dataset.updated.clone(),
+        href: dataset.href.clone(),
+        id: dataset.id.clone(),
+        size: Some(new_sizes),
+        dimension: Some(new_dimensions),
+        value: Some(DatasetValue::Array(new_values)),
+        status: if has_status {
+            Some(serde_json::Value::Array(new_status))
+        } else {
+            None
+        },
+        role: dataset.role.clone(),
+        note: dataset.note.clone(),
+        link: dataset.link.clone(),
+        extension: dataset.extension.clone(),
+        error: dataset.error.clone(),
+    };
 
     Ok(new_dataset)
 }
@@ -1820,7 +1887,10 @@ fn transform_arrobj(
 
     let total: usize = sizes.iter().product();
     let mut result = Vec::with_capacity(total);
-    for (flat, indices) in query::index_iter(sizes).enumerate() {
+    let mut odo = query::Odometer::new(sizes);
+    let mut flat = 0usize;
+    while !odo.done() {
+        let indices = odo.current();
         let mut obj = serde_json::Map::new();
         for col in &columns {
             obj.insert(col.name.clone(), column_cell(col, indices[col.dim_idx]));
@@ -1832,6 +1902,8 @@ fn transform_arrobj(
             obj.insert(status_key.clone(), st);
         }
         result.push(serde_json::Value::Object(obj));
+        odo.advance();
+        flat += 1;
     }
 
     Ok(serde_json::Value::Array(result))
@@ -1881,32 +1953,38 @@ fn transform_arrobj_by(
     // Generate all index combos for non-by dimensions
     let non_by_sizes: Vec<usize> = non_by_dim_indices.iter().map(|&idx| sizes[idx]).collect();
 
-    let mut result = Vec::new();
+    // Precompute strides so the flat index for each by-category is a single
+    // add/multiply instead of a full `calculate_index` pass per cell.
+    let strides = query::strides(sizes);
+    let by_stride = strides[by_dim_idx];
 
-    for non_by_combo in query::index_iter(&non_by_sizes) {
+    let mut result = Vec::new();
+    let mut base_indices = vec![0usize; dim_ids.len()];
+    let mut odo = query::Odometer::new(&non_by_sizes);
+    while !odo.done() {
+        let non_by_combo = odo.current();
         let mut obj = serde_json::Map::new();
 
-        // Map non_by_combo back to full indices (placeholder for by-dim)
-        let mut base_indices = vec![0usize; dim_ids.len()];
+        // Map non_by_combo back to full indices (by-dim stays at 0 here).
         for (combo_idx, &dim_idx) in non_by_dim_indices.iter().enumerate() {
             base_indices[dim_idx] = non_by_combo[combo_idx];
         }
+        let base_flat = query::calculate_index(&base_indices, sizes).unwrap_or(0);
 
         // Fill non-by dimension values
         for (col, &cat_pos) in columns.iter().zip(non_by_combo.iter()) {
             obj.insert(col.name.clone(), column_cell(col, cat_pos));
         }
 
-        // Fill by-dimension categories as columns
+        // Fill by-dimension categories as columns (incremental flat index)
         for (by_cat_pos, col_name) in by_col_names.iter().enumerate() {
-            let mut full_indices = base_indices.clone();
-            full_indices[by_dim_idx] = by_cat_pos;
-            let flat = query::calculate_index(&full_indices, sizes).unwrap_or(0);
+            let flat = base_flat + by_cat_pos * by_stride;
             let val = values.get_at(flat);
             obj.insert(col_name.clone(), format_cell(&val, comma));
         }
 
         result.push(serde_json::Value::Object(obj));
+        odo.advance();
     }
 
     Ok(serde_json::Value::Array(result))
@@ -1946,8 +2024,11 @@ fn transform_array(
     result.push(serde_json::Value::Array(header));
 
     // Data rows
-    for (flat, indices) in query::index_iter(sizes).enumerate() {
-        let mut row = Vec::new();
+    let mut odo = query::Odometer::new(sizes);
+    let mut flat = 0usize;
+    while !odo.done() {
+        let indices = odo.current();
+        let mut row = Vec::with_capacity(columns.len() + 2);
         for col in &columns {
             row.push(column_cell(col, indices[col.dim_idx]));
         }
@@ -1958,6 +2039,8 @@ fn transform_array(
             row.push(st);
         }
         result.push(serde_json::Value::Array(row));
+        odo.advance();
+        flat += 1;
     }
 
     Ok(serde_json::Value::Array(result))
@@ -2004,7 +2087,10 @@ fn transform_objarr(
     }
 
     // Fill data
-    for (flat, indices) in query::index_iter(sizes).enumerate() {
+    let mut odo = query::Odometer::new(sizes);
+    let mut flat = 0usize;
+    while !odo.done() {
+        let indices = odo.current();
         for col in &columns {
             let cell_val = column_cell(col, indices[col.dim_idx]);
             if let Some(serde_json::Value::Array(arr)) = obj.get_mut(&col.name) {
@@ -2023,6 +2109,8 @@ fn transform_objarr(
                 arr.push(st);
             }
         }
+        odo.advance();
+        flat += 1;
     }
 
     Ok(serde_json::Value::Object(obj))
@@ -2088,12 +2176,19 @@ fn transform_objarr_by(
         );
     }
 
+    // Precompute strides for incremental by-dimension flat indices.
+    let strides = query::strides(sizes);
+    let by_stride = strides[by_dim_idx];
+
     // Fill data
-    for non_by_combo in query::index_iter(&non_by_sizes) {
-        let mut base_indices = vec![0usize; dim_ids.len()];
+    let mut base_indices = vec![0usize; dim_ids.len()];
+    let mut odo = query::Odometer::new(&non_by_sizes);
+    while !odo.done() {
+        let non_by_combo = odo.current();
         for (combo_idx, &dim_idx) in non_by_dim_indices.iter().enumerate() {
             base_indices[dim_idx] = non_by_combo[combo_idx];
         }
+        let base_flat = query::calculate_index(&base_indices, sizes).unwrap_or(0);
 
         // Non-by dimension values
         for (col, &cat_pos) in columns.iter().zip(non_by_combo.iter()) {
@@ -2103,16 +2198,15 @@ fn transform_objarr_by(
             }
         }
 
-        // By-dimension category values
+        // By-dimension category values (incremental flat index)
         for (by_cat_pos, col_name) in by_col_names.iter().enumerate() {
-            let mut full_indices = base_indices.clone();
-            full_indices[by_dim_idx] = by_cat_pos;
-            let flat = query::calculate_index(&full_indices, sizes).unwrap_or(0);
+            let flat = base_flat + by_cat_pos * by_stride;
             let val = values.get_at(flat);
             if let Some(serde_json::Value::Array(arr)) = obj.get_mut(col_name) {
                 arr.push(format_cell(&val, comma));
             }
         }
+        odo.advance();
     }
 
     Ok(serde_json::Value::Object(obj))
@@ -2172,8 +2266,11 @@ fn transform_object(
     // Build rows
     let total: usize = sizes.iter().product();
     let mut rows = Vec::with_capacity(total);
-    for (flat, indices) in query::index_iter(sizes).enumerate() {
-        let mut c = Vec::new();
+    let mut odo = query::Odometer::new(sizes);
+    let mut flat = 0usize;
+    while !odo.done() {
+        let indices = odo.current();
+        let mut c = Vec::with_capacity(columns.len() + 2);
         for col in &columns {
             c.push(serde_json::json!({ "v": column_cell(col, indices[col.dim_idx]) }));
         }
@@ -2184,6 +2281,8 @@ fn transform_object(
             c.push(serde_json::json!({ "v": st }));
         }
         rows.push(serde_json::json!({ "c": c }));
+        odo.advance();
+        flat += 1;
     }
 
     Ok(serde_json::json!({ "cols": cols, "rows": rows }))
@@ -2402,6 +2501,57 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn test_from_json_str_class_detection() {
+        // Each class routes to the correct variant via the early-exit finder.
+        let ds = JsonStatResponse::from_json_str(sample_dataset_json()).unwrap();
+        assert!(matches!(ds, JsonStatResponse::Dataset(_)));
+
+        let col = JsonStatResponse::from_json_str(sample_collection_json()).unwrap();
+        assert!(matches!(col, JsonStatResponse::Collection(_)));
+
+        let dim = r#"{"version":"2.0","class":"dimension",
+            "category":{"index":["a","b"]}}"#;
+        let dim = JsonStatResponse::from_json_str(dim).unwrap();
+        assert!(matches!(dim, JsonStatResponse::Dimension(_)));
+    }
+
+    #[test]
+    fn test_from_json_str_class_after_value() {
+        // `class` appears AFTER a (large-ish) value array: the early-exit
+        // finder must still locate it (it only short-circuits once found).
+        let json = r#"{
+            "version": "2.0",
+            "id": ["x"], "size": [5],
+            "dimension": {"x": {"category": {"index": ["a","b","c","d","e"]}}},
+            "value": [10, 20, 30, 40, 50],
+            "class": "dataset"
+        }"#;
+        let resp = JsonStatResponse::from_json_str(json).unwrap();
+        match resp {
+            JsonStatResponse::Dataset(d) => {
+                assert_eq!(d.value.as_ref().unwrap().get_at(2).as_f64(), Some(30.0));
+            }
+            _ => panic!("Expected dataset"),
+        }
+    }
+
+    #[test]
+    fn test_from_json_str_missing_class_defaults_to_dataset() {
+        // No `class` key → default to "dataset" (parses if it's dataset-shaped).
+        let json = r#"{"version":"2.0","id":["x"],"size":[2],
+            "dimension":{"x":{"category":{"index":["a","b"]}}},
+            "value":[1,2]}"#;
+        let resp = JsonStatResponse::from_json_str(json).unwrap();
+        assert!(matches!(resp, JsonStatResponse::Dataset(_)));
+    }
+
+    #[test]
+    fn test_from_json_str_unknown_class_errors() {
+        let json = r#"{"version":"2.0","class":"bogus"}"#;
+        assert!(JsonStatResponse::from_json_str(json).is_err());
     }
 
     #[test]
@@ -2661,6 +2811,70 @@ mod tests {
         let values = diced.value.as_ref().unwrap();
         assert_eq!(values.get_at(0).as_f64(), Some(38.0));
         assert_eq!(values.get_at(1).as_f64(), Some(39.0));
+    }
+
+    #[test]
+    fn test_dice_two_dimensions_at_once() {
+        // Regression for the stride-based incremental flat-index walk:
+        // filter BOTH non-constant dimensions simultaneously so the kept
+        // space is a true multi-dimension cartesian product.
+        // Layout (sizes [1,2,2], values [331,332,38,39]):
+        //   area=US year=2020 -> 331   area=US year=2021 -> 332
+        //   area=CA year=2020 -> 38    area=CA year=2021 -> 39
+        let dataset = dataset_from(sample_dataset_json());
+        let mut filter = HashMap::new();
+        filter.insert("area".to_string(), vec!["CA".to_string()]);
+        filter.insert("year".to_string(), vec!["2021".to_string()]);
+
+        let diced = dice_dataset(&dataset, &filter, false).unwrap();
+        assert_eq!(diced.size.as_ref().unwrap(), &vec![1, 1, 1]);
+        let values = diced.value.as_ref().unwrap();
+        assert_eq!(values.get_at(0).as_f64(), Some(39.0));
+    }
+
+    #[test]
+    fn test_dice_two_dimensions_multi_category_order() {
+        // Keep both year categories but only CA: result must be row-major over
+        // (area=CA) x (year=2020, year=2021) -> [38, 39].
+        let dataset = dataset_from(sample_dataset_json());
+        let mut filter = HashMap::new();
+        filter.insert("area".to_string(), vec!["CA".to_string()]);
+        // year filter lists categories reversed; original order must win.
+        filter.insert(
+            "year".to_string(),
+            vec!["2021".to_string(), "2020".to_string()],
+        );
+
+        let diced = dice_dataset(&dataset, &filter, false).unwrap();
+        assert_eq!(diced.size.as_ref().unwrap(), &vec![1, 1, 2]);
+        let values = diced.value.as_ref().unwrap();
+        assert_eq!(values.get_at(0).as_f64(), Some(38.0));
+        assert_eq!(values.get_at(1).as_f64(), Some(39.0));
+    }
+
+    #[test]
+    fn test_dice_preserves_status() {
+        // Status array must be subset in lockstep with values.
+        let json = r#"{
+            "version": "2.0", "class": "dataset",
+            "id": ["x"], "size": [3],
+            "dimension": {"x": {"category": {"index": ["a", "b", "c"]}}},
+            "value": [1.0, 2.0, 3.0],
+            "status": ["ok", "est", "ok"]
+        }"#;
+        let dataset = dataset_from(json);
+        let mut filter = HashMap::new();
+        filter.insert("x".to_string(), vec!["c".to_string(), "a".to_string()]);
+
+        let diced = dice_dataset(&dataset, &filter, false).unwrap();
+        assert_eq!(diced.size.as_ref().unwrap(), &vec![2]);
+        let values = diced.value.as_ref().unwrap();
+        // Original order (a before c) preserved -> values [1, 3].
+        assert_eq!(values.get_at(0).as_f64(), Some(1.0));
+        assert_eq!(values.get_at(1).as_f64(), Some(3.0));
+        // Status subset must align: ["ok", "ok"].
+        let status = diced.status.as_ref().unwrap();
+        assert_eq!(status, &serde_json::json!(["ok", "ok"]));
     }
 
     #[test]
