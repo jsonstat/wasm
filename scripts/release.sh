@@ -4,9 +4,9 @@
 # This is the local half of the release flow. It does NOT publish to npm
 # itself; instead it creates and pushes the `v<version>` git tag, which
 # triggers .github/workflows/release.yml to build, verify, publish to npm and
-# create the GitHub Release. Keeping the publish step in CI means the npm
-# token lives only as a GitHub secret (NPM_TOKEN) and never on a developer
-# machine.
+# create the GitHub Release. Keeping the publish step in CI means no npm
+# credentials ever live on a developer machine: the workflow authenticates to
+# npm via Trusted Publishing (OIDC), which mints a short-lived token per run.
 #
 # What it does:
 #   1. Reads the version from Cargo.toml (single source of truth).
@@ -20,8 +20,8 @@
 #   ./scripts/release.sh --dry-run   # print what would happen, change nothing
 #   ./scripts/release.sh --no-build  # skip the local build sanity check
 #
-# Prerequisites: a clean git tree, push access to `origin`, and the GitHub
-# secret NPM_TOKEN configured for the publish workflow (see docs/INSTALL.md).
+# Prerequisites: a clean git tree, push access to `origin`, and the publish
+# workflow configured with npm Trusted Publishing (OIDC) (see docs/INSTALL.md).
 set -euo pipefail
 
 # ── Config ───────────────────────────────────────────────────────────────
