@@ -74,9 +74,14 @@ no build step, no package manager**. You only need a plain `.html` file.
   <pre id="output">Loading…</pre>
 
   <script type="module">
-    // 1. Import JSONstat from the jsDelivr CDN (always the latest version).
+    // 1. Import JSONstat from a CDN (in production, pin to a proven
+    //    specific version instead of @latest for safety).
+    //    jsDelivr (default):
     import { JSONstat }
       from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@latest/jsonstat.js';
+    //    …or unpkg (choose either one):
+    // import { JSONstat }
+    //   from 'https://unpkg.com/jsonstat-wasm@latest/jsonstat.js';
 
     // 2. Point at any JSON-stat dataset (here, the OECD sample).
     const url = 'https://json-stat.org/samples/oecd.json';

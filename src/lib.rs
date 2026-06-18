@@ -1,7 +1,10 @@
 pub mod models;
 pub mod query;
 
-use models::{Cell, CollectionItem, Dataset, DatasetValue, Dimension, JsonStatResponse};
+use models::{
+    Cell, Collection, CollectionItem, Dataset, DatasetValue, Dimension, DimensionResponse,
+    JsonStatResponse,
+};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -54,16 +57,117 @@ fn to_js_value_result<T: serde::Serialize>(val: &T) -> Result<JsValue, JsValue> 
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
-/// A `{value, status}` pair as returned by `Data()`.
+/// Deserialize a JSON-stat **object** (already parsed by the JS engine) into
+/// the typed model via `serde-wasm-bindgen`, with class-based variant
+/// selection.
 ///
-/// Serializing this struct uses the `&'static str` field names `"value"` and
-/// `"status"`, so the hot `Data()` loops avoid the two per-cell `String` key
-/// allocations the `serde_json::json!({ "value": .., "status": .. })` macro
-/// would otherwise perform. The emitted JS object shape is identical.
-#[derive(serde::Serialize)]
-struct DataPoint {
-    value: Cell,
-    status: serde_json::Value,
+/// This is the object-input fast path used by [`JSONstat::from_object`]: the
+/// JS facade passes the already-parsed JS object straight through instead of
+/// `JSON.stringify`-ing it and re-parsing the string with `serde_json`. V8's
+/// native `JSON.parse` is faster than `serde_json`, so we let the JS engine
+/// own the lexing and only pay one `serde-wasm-bindgen` traversal into Rust —
+/// no string copy into WASM linear memory, no second lex pass.
+///
+/// The optional `.class` field is peeked via `Reflect::get` (cheap, no full
+/// deserialize) to pick the right variant, mirroring
+/// [`JsonStatResponse::from_json_str`].
+fn response_from_js_value(js: JsValue) -> Result<JsonStatResponse, JsValue> {
+    let class = js_sys::Reflect::get(&js, &JsValue::from_str("class"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "dataset".to_string());
+
+    let result = match class.as_str() {
+        "dataset" => serde_wasm_bindgen::from_value::<Dataset>(js).map(JsonStatResponse::Dataset),
+        "dimension" => {
+            serde_wasm_bindgen::from_value::<DimensionResponse>(js).map(JsonStatResponse::Dimension)
+        }
+        "collection" => {
+            serde_wasm_bindgen::from_value::<Collection>(js).map(JsonStatResponse::Collection)
+        }
+        other => return Err(JsValue::from_str(&format!("Unknown class: '{}'", other))),
+    };
+    result.map_err(|e| JsValue::from_str(&format!("Failed to parse JSON-stat: {}", e)))
+}
+
+/// Materialize a slice of cells into a JS array, with a **Float64Array fast
+/// path**.
+///
+/// When every cell is a number (the overwhelmingly common case for a JSON-stat
+/// dataset's `value` array), this returns a [`js_sys::Float64Array`] — a single
+/// contiguous `f64` buffer the JS engine consumes directly, instead of `N`
+/// separately-boxed JS numbers inside a `js_sys::Array`. This is a large,
+/// near-linear speed-up for large numeric datasets, and the values are still
+/// addressable by index (`arr[i]`).
+///
+/// If any cell is a string or null, the values cannot live in a typed array, so
+/// it falls back to building a plain `js_sys::Array` of mixed
+/// number/string/null elements (via [`cell_to_js`]), preserving JSON-stat 2.0
+/// semantics.
+///
+/// Note (v0.2.0 breaking change): the `value` getter may now return a
+/// `Float64Array` where v0.1.x returned an `Array`. Index access
+/// (`ds.value[i]`) and `length` are unchanged; only `Array.isArray(...)`-style
+/// type checks are affected.
+fn cells_slice_to_js(cells: &[Cell]) -> JsValue {
+    if cells.iter().all(|c| matches!(c, Cell::Number(_))) {
+        let nums: Vec<f64> = cells
+            .iter()
+            .map(|c| match c {
+                Cell::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+                _ => unreachable!("guarded by the `all` check above"),
+            })
+            .collect();
+        return js_sys::Float64Array::from(&nums[..]).into();
+    }
+    let out = js_sys::Array::new();
+    for cell in cells {
+        out.push(&cell_to_js(cell));
+    }
+    out.into()
+}
+
+/// Convert a [`Cell`] directly to a [`JsValue`], bypassing the serde
+/// `Serialize` trait dispatch.
+///
+/// `serde_json::Number` → `f64` (matching how `serde-wasm-bindgen` materializes
+/// JSON-stat numbers as JS numbers), strings → JS strings, null → `null`.
+/// Skipping the per-cell serde machinery shaves overhead in the hot `Data()`
+/// loops, which iterate one cell per dataset value.
+fn cell_to_js(cell: &Cell) -> JsValue {
+    match cell {
+        Cell::Number(n) => JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN)),
+        Cell::String(s) => JsValue::from_str(s),
+        Cell::Null => JsValue::NULL,
+    }
+}
+
+thread_local! {
+    /// Cached `"value"` / `"status"` JS string keys. The hot `Data()` bulk
+    /// loops build one object per cell; caching these avoids allocating a fresh
+    /// JS string for the two property names on every iteration.
+    static VALUE_KEY: JsValue = JsValue::from_str("value");
+    static STATUS_KEY: JsValue = JsValue::from_str("status");
+}
+
+/// Build a `{value, status}` JS object directly, skipping the
+/// `serde_json::Value` tree + `serde-wasm-bindgen` re-walk that
+/// `serde_json::json!({ "value", "status" })` + [`to_js_value_result`]
+/// performs.
+///
+/// This is the per-cell fast path for `Data()`: one `js_sys::Object` allocation
+/// and two `Reflect::set` calls, with no intermediate `serde_json::Value` and
+/// no serde trait dispatch on the value cell. `status` is still small
+/// (typically a string/null), so it goes through the boundary serializer.
+fn data_point_js(value: &Cell, status: &JsValue) -> JsValue {
+    let obj = js_sys::Object::new();
+    let (vk, sk) = (
+        VALUE_KEY.with(|v| v.clone()),
+        STATUS_KEY.with(|s| s.clone()),
+    );
+    let _ = js_sys::Reflect::set(&obj, &vk, &cell_to_js(value));
+    let _ = js_sys::Reflect::set(&obj, &sk, status);
+    obj.into()
 }
 
 /// Extract a dataset reference from the response, or error.
@@ -243,6 +347,46 @@ fn status_at(dataset: &Dataset, flat: usize) -> serde_json::Value {
         // A plain string applies to all values (JSON-stat 2.0)
         Some(serde_json::Value::String(s)) => serde_json::Value::String(s.clone()),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Get a status value for a flat index **directly as a [`JsValue`]**.
+///
+/// This is the per-cell fast path used by [`data_point_js`] in the hot `Data()`
+/// loops. Unlike [`status_at`] it never clones a `serde_json::Value`: it
+/// materializes the JS primitive straight from the borrowed status value, so
+/// the per-cell cost is a single boundary conversion instead of a clone + a
+/// serde re-walk. Returns `null` when the status is absent or out of range.
+fn status_at_js(dataset: &Dataset, flat: usize) -> JsValue {
+    match &dataset.status {
+        // Common case: status is an array of short strings/flags.
+        Some(serde_json::Value::Array(arr)) => match arr.get(flat) {
+            Some(serde_json::Value::String(s)) => JsValue::from_str(s),
+            Some(serde_json::Value::Number(n)) => {
+                JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN))
+            }
+            Some(serde_json::Value::Bool(b)) => JsValue::from_bool(*b),
+            _ => JsValue::NULL,
+        },
+        // Sparse status object.
+        Some(serde_json::Value::Object(map)) => {
+            let mut buf = [0u8; 20];
+            match map.get(query::usize_key(&mut buf, flat)) {
+                Some(serde_json::Value::String(s)) => JsValue::from_str(s),
+                Some(serde_json::Value::Number(n)) => {
+                    JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN))
+                }
+                Some(serde_json::Value::Bool(b)) => JsValue::from_bool(*b),
+                Some(other) => to_js_value(other),
+                None => JsValue::NULL,
+            }
+        }
+        // A plain string applies to all values (JSON-stat 2.0).
+        Some(serde_json::Value::String(s)) => JsValue::from_str(s),
+        // Any other shape (bool, number, nested object) — fall back to the
+        // boundary serializer on the borrowed value (no clone).
+        Some(other) => to_js_value(other),
+        None => JsValue::NULL,
     }
 }
 
@@ -441,6 +585,18 @@ impl JSONstat {
         Ok(JSONstat { response })
     }
 
+    /// Parses a JSON-stat **object** (already parsed by the JS engine) into a
+    /// WebAssembly-managed object.
+    ///
+    /// Object-input fast path: avoids the `JSON.stringify` + string re-parse
+    /// that [`JSONstat::new`] would require. The JS facade uses this for
+    /// `JSONstat(obj)`. Exposed as the static method `JSONstat.fromObject()`.
+    #[wasm_bindgen]
+    pub fn from_object(js: JsValue) -> Result<JSONstat, JsValue> {
+        let response = response_from_js_value(js)?;
+        Ok(JSONstat { response })
+    }
+
     // ── Property Getters ──────────────────────────────────────────────
 
     /// Returns the JSON-stat version.
@@ -633,7 +789,15 @@ impl JSONstat {
         }
     }
 
-    /// Returns the values array (numbers, strings or nulls) as a dense array.
+    /// Returns the values (numbers, strings or nulls) as a dense sequence.
+    ///
+    /// **Fast path (v0.2.0):** when *every* value is a number, returns a
+    /// [`Float64Array`] — a contiguous `f64` buffer — instead of an `Array` of
+    /// boxed numbers. This is a transparent speed-up for index-based access
+    /// (`ds.value[i]`, `.length`, iteration), but is a **minor breaking
+    /// change**: callers that do `Array.isArray(ds.value)` will now see `false`
+    /// on all-numeric datasets. Use `Array.from(ds.value)` if a real `Array` is
+    /// required. Mixed (string/null) datasets still return a plain `Array`.
     #[wasm_bindgen(getter)]
     pub fn value(&self) -> JsValue {
         let dataset = match require_dataset(&self.response) {
@@ -641,16 +805,17 @@ impl JSONstat {
             Err(_) => return JsValue::NULL,
         };
         match &dataset.value {
-            Some(DatasetValue::Array(arr)) => to_js_value(arr),
+            Some(DatasetValue::Array(arr)) => cells_slice_to_js(arr),
             Some(value @ DatasetValue::Map(_)) => {
-                // Convert sparse map to dense array
+                // Convert sparse map to dense, then apply the same
+                // Float64Array fast path.
                 let len: usize = dataset
                     .size
                     .as_ref()
                     .map(|s| s.iter().product())
                     .unwrap_or(0);
-                let arr: Vec<Cell> = (0..len).map(|i| value.get_at(i)).collect();
-                to_js_value(&arr)
+                let cells: Vec<Cell> = (0..len).map(|i| value.get_at(i)).collect();
+                cells_slice_to_js(&cells)
             }
             None => JsValue::NULL,
         }
@@ -682,7 +847,7 @@ impl JSONstat {
             }
         }
 
-        to_js_value_result(&value.get_at(flat_index))
+        Ok(cell_to_js(&value.get_at(flat_index)))
     }
 
     // ── Data() ────────────────────────────────────────────────────────
@@ -707,29 +872,30 @@ impl JSONstat {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Dataset has no values"))?;
 
-        // No argument → all data
+        // No argument → all data. Build the JS array directly instead of a
+        // `Vec<DataPoint>` / `Vec<Cell>` + serde-wasm-bindgen re-walk: one pass,
+        // no intermediate Rust vector, no per-cell serde dispatch. The
+        // values-only (`want_status == false`) branch additionally uses the
+        // Float64Array fast path when all values are numeric.
         if dataid_js.is_undefined() || dataid_js.is_null() {
             let sizes = dataset
                 .size
                 .as_ref()
                 .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
             let total: usize = sizes.iter().product();
-            if want_status {
-                let mut result = Vec::with_capacity(total);
-                for i in 0..total {
-                    result.push(DataPoint {
-                        value: values.get_at(i),
-                        status: status_at(dataset, i),
-                    });
-                }
-                return to_js_value_result(&result);
-            } else {
-                let mut result = Vec::with_capacity(total);
-                for i in 0..total {
-                    result.push(values.get_at(i));
-                }
-                return to_js_value_result(&result);
+            if !want_status {
+                // Values-only: collect once and let `cells_slice_to_js` pick the
+                // Float64Array fast path for all-numeric datasets.
+                let cells: Vec<Cell> = (0..total).map(|i| values.get_at(i)).collect();
+                return Ok(cells_slice_to_js(&cells));
             }
+            let arr = js_sys::Array::new();
+            for i in 0..total {
+                let v = values.get_at(i);
+                let s = status_at_js(dataset, i);
+                arr.push(&data_point_js(&v, &s));
+            }
+            return Ok(arr.into());
         }
 
         // Try as integer (flat index)
@@ -748,14 +914,10 @@ impl JSONstat {
             }
             let val = values.get_at(idx);
             if want_status {
-                let st = status_at(dataset, idx);
-                let obj = serde_json::json!({
-                    "value": val,
-                    "status": st
-                });
-                return to_js_value_result(&obj);
+                let st = status_at_js(dataset, idx);
+                return Ok(data_point_js(&val, &st));
             } else {
-                return to_js_value_result(&val);
+                return Ok(cell_to_js(&val));
             }
         }
 
@@ -771,14 +933,10 @@ impl JSONstat {
                 .ok_or_else(|| JsValue::from_str("Invalid dimension indices"))?;
             let val = values.get_at(flat);
             if want_status {
-                let st = status_at(dataset, flat);
-                let obj = serde_json::json!({
-                    "value": val,
-                    "status": st
-                });
-                return to_js_value_result(&obj);
+                let st = status_at_js(dataset, flat);
+                return Ok(data_point_js(&val, &st));
             } else {
-                return to_js_value_result(&val);
+                return Ok(cell_to_js(&val));
             }
         }
 
@@ -805,10 +963,10 @@ impl JSONstat {
             QueryResolution::Single(flat) => {
                 let val = values.get_at(flat);
                 if want_status {
-                    let st = status_at(dataset, flat);
-                    to_js_value_result(&serde_json::json!({ "value": val, "status": st }))
+                    let st = status_at_js(dataset, flat);
+                    Ok(data_point_js(&val, &st))
                 } else {
-                    to_js_value_result(&val)
+                    Ok(cell_to_js(&val))
                 }
             }
             QueryResolution::Slice {
@@ -821,26 +979,27 @@ impl JSONstat {
                         JsValue::from_str("Failed to calculate row-major order index")
                     })
                 };
-                if want_status {
-                    let mut out = Vec::with_capacity(free_cat_indices.len());
+                // Build the slice directly: one pass over the free dimension,
+                // no intermediate `Vec` + serde re-walk. The values-only branch
+                // additionally uses the Float64Array fast path.
+                if !want_status {
+                    let mut cells = Vec::with_capacity(free_cat_indices.len());
                     for ci in free_cat_indices {
                         fixed[free_dim_idx] = ci;
                         let flat = flat_at(&fixed)?;
-                        out.push(DataPoint {
-                            value: values.get_at(flat),
-                            status: status_at(dataset, flat),
-                        });
+                        cells.push(values.get_at(flat));
                     }
-                    to_js_value_result(&out)
-                } else {
-                    let mut out = Vec::with_capacity(free_cat_indices.len());
-                    for ci in free_cat_indices {
-                        fixed[free_dim_idx] = ci;
-                        let flat = flat_at(&fixed)?;
-                        out.push(values.get_at(flat));
-                    }
-                    to_js_value_result(&out)
+                    return Ok(cells_slice_to_js(&cells));
                 }
+                let arr = js_sys::Array::new();
+                for ci in free_cat_indices {
+                    fixed[free_dim_idx] = ci;
+                    let flat = flat_at(&fixed)?;
+                    let v = values.get_at(flat);
+                    let s = status_at_js(dataset, flat);
+                    arr.push(&data_point_js(&v, &s));
+                }
+                Ok(arr.into())
             }
         }
     }

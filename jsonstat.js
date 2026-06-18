@@ -25,7 +25,7 @@
 // That means a CDN consumer can simply:
 //
 //     import { JSONstat }
-//       from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.1.2/jsonstat.js';
+//       from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.2.0/jsonstat.js';
 //
 // and initialization is fully automatic.
 //
@@ -74,6 +74,16 @@ export function JSONstat(input, options) {
     }
 
     // URL string: fetch, then parse the response text.
+    //
+    // This path deliberately parses via the WASM constructor (serde_json on the
+    // contiguous body string) rather than `resp.json()` + `fromObject()`. For a
+    // fetched body that is NOT yet parsed, serde_json is a single pure-Rust
+    // traversal with no per-token JS-engine crossings, whereas `resp.json()` +
+    // `fromObject()` would be TWO traversals (native JSON.parse, then a
+    // serde-wasm-bindgen walk that pays a `Reflect::get` call per array element)
+    // — a regression for large datasets. (simd-json was also evaluated and
+    // rejected: it requires `target-feature=+simd128`, breaking older browsers,
+    // and its scalar fallback is slower than serde_json.)
     if (typeof input === 'string') {
         return (async () => {
             await ready;
@@ -82,10 +92,14 @@ export function JSONstat(input, options) {
         })();
     }
 
-    // JSON-stat object: stringify (the WASM constructor only accepts a
-    // string) and parse.
+    // JSON-stat object: pass straight into WASM. `fromObject` deserializes
+    // the JS object directly into the Rust model via serde-wasm-bindgen,
+    // avoiding the JSON.stringify + re-parse round-trip. V8's native
+    // JSON.parse (which already produced this object) is faster than
+    // serde_json, so we let the JS engine own the lexing and traverse the
+    // object only once on the Rust side.
     return (async () => {
         await ready;
-        return new _JSONstat(JSON.stringify(input));
+        return _JSONstat.fromObject(input);
     })();
 }

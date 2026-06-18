@@ -161,7 +161,15 @@ Status information for dataset values. `array | object | null`. Available for da
 
 ### `value`
 
-All dataset values as a dense array. `any[] | null`. Sparse (map-based) values are expanded to a dense array. Available for dataset responses.
+All dataset values as a dense sequence. `Float64Array | any[] | null`.
+
+> **Since v0.2.0 (minor breaking change):** when *every* value is a number, this
+> returns a **`Float64Array`** (a contiguous `f64` buffer) rather than a plain
+> `Array` of boxed numbers. Index access (`ds.value[i]`), `.length`, iteration
+> and spread all behave identically; only `Array.isArray(ds.value)` is affected
+> (use `Array.from(ds.value)` to normalize). Datasets containing any string or
+> `null` value still return a plain `Array`. Sparse (map-based) values are
+> always expanded to a dense sequence. Available for dataset responses.
 
 ---
 
@@ -343,7 +351,9 @@ const d = ds.Data({ concept: "UNR", area: "GR", year: "2014" });
 
 // Partial query: one dimension ("year") left free → returns an array slice
 const series = ds.Data({ concept: "UNR", area: "GR" }, false);
-// [ 5.9, 5.4, 5.0, ... ]  — one entry per year
+// [ 5.9, 5.4, 5.0, ... ]  — one entry per year.
+// (v0.2.0: when all values are numbers this is a Float64Array; index access
+//  is unchanged. Use Array.from(...) if a real Array is required.)
 ```
 
 ---
