@@ -589,7 +589,7 @@ impl JSONstat {
     /// Object-input fast path: avoids the `JSON.stringify` + string re-parse
     /// that [`JSONstat::new`] would require. The JS facade uses this for
     /// `JSONstat(obj)`. Exposed as the static method `JSONstat.fromObject()`.
-    #[wasm_bindgen]
+    #[wasm_bindgen(js_name = "fromObject")]
     pub fn from_object(js: JsValue) -> Result<JSONstat, JsValue> {
         let response = response_from_js_value(js)?;
         Ok(JSONstat { response })

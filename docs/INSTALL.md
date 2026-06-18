@@ -134,14 +134,14 @@ esm.sh). Two entry points are available:
 | `…/jsonstat.js` | **High-level facade** — `JSONstat()` toolkit function with automatic one-time init (recommended) |
 | `…/jsonstat_wasm.js` | **Low-level glue** — raw `JSONstat` class + `init()` you call yourself |
 
-Always **pin the version** (here `0.2.0`, matching `Cargo.toml` / `package.json`).
+Always **pin the version** (here `0.2.1`, matching `Cargo.toml` / `package.json`).
 
 #### High-level facade (recommended)
 
 ```html
 <script type="module">
   import { JSONstat }
-    from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.2.0/jsonstat.js';
+    from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.2.1/jsonstat.js';
 
   // No init() needed — the facade initializes the WASM module exactly once
   // on first import and gates every call behind that shared promise.
@@ -158,7 +158,7 @@ at the exact `.js` file the binary is fetched automatically:
 
 ```js
 import init, { JSONstat, init_panic_hook }
-  from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.2.0/jsonstat_wasm.js';
+  from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.2.1/jsonstat_wasm.js';
 
 await init();          // .wasm resolved via import.meta.url ✅
 init_panic_hook();
@@ -171,9 +171,9 @@ case pass the binary URL directly to `init()`, which accepts a
 `string` / `URL` / `Request`:
 
 ```js
-import init, { JSONstat } from 'https://esm.sh/jsonstat-wasm@0.2.0/glue';
+import init, { JSONstat } from 'https://esm.sh/jsonstat-wasm@0.2.1/glue';
 
-await init('https://esm.sh/jsonstat-wasm@0.2.0/jsonstat_wasm_bg.wasm');
+await init('https://esm.sh/jsonstat-wasm@0.2.1/jsonstat_wasm_bg.wasm');
 const ds = new JSONstat(jsonStr);
 ```
 

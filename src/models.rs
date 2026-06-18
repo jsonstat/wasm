@@ -4,6 +4,38 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
+// ── Null-tolerant role deserializer ───────────────────────────────────────
+//
+// jsonstat-toolkit normalizes `role` and may emit values of `null`
+// (e.g. `role.classification = null`). serde-wasm-bindgen refuses to
+// coerce `null` into `Vec<String>` and throws `Reflect.get called on
+// non-object`. We treat any `null` value as an empty `Vec<String>` so
+// the object fast path never trips on it.
+fn deserialize_role<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NullOrVec {
+        Null,
+        Vec(Vec<String>),
+    }
+
+    let opt: Option<HashMap<String, NullOrVec>> =
+        Option::deserialize(deserializer)?;
+    Ok(opt.map(|map| {
+        map.into_iter()
+            .map(|(k, v)| match v {
+                NullOrVec::Vec(items) => (k, items),
+                NullOrVec::Null => (k, Vec::new()),
+            })
+            .collect()
+    }))
+}
+
 // ── JsonStatResponse with class-based discrimination ──────────────────────
 
 #[derive(Serialize, Debug, Clone)]
@@ -164,6 +196,7 @@ pub struct Dataset {
     pub dimension: Option<IndexMap<String, Dimension>>,
     pub value: Option<DatasetValue>,
     pub status: Option<serde_json::Value>,
+    #[serde(deserialize_with = "deserialize_role", default)]
     pub role: Option<HashMap<String, Vec<String>>>,
     pub note: Option<Vec<String>>,
     pub link: Option<HashMap<String, Vec<LinkItem>>>,
