@@ -362,9 +362,7 @@ fn status_at_js(dataset: &Dataset, flat: usize) -> JsValue {
         // Common case: status is an array of short strings/flags.
         Some(serde_json::Value::Array(arr)) => match arr.get(flat) {
             Some(serde_json::Value::String(s)) => JsValue::from_str(s),
-            Some(serde_json::Value::Number(n)) => {
-                JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN))
-            }
+            Some(serde_json::Value::Number(n)) => JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN)),
             Some(serde_json::Value::Bool(b)) => JsValue::from_bool(*b),
             _ => JsValue::NULL,
         },
