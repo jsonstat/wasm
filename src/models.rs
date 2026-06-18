@@ -24,8 +24,7 @@ where
         Vec(Vec<String>),
     }
 
-    let opt: Option<HashMap<String, NullOrVec>> =
-        Option::deserialize(deserializer)?;
+    let opt: Option<HashMap<String, NullOrVec>> = Option::deserialize(deserializer)?;
     Ok(opt.map(|map| {
         map.into_iter()
             .map(|(k, v)| match v {
