@@ -836,9 +836,7 @@ impl JSONstat {
         let js = match &dataset.value {
             // Numbers fast path: one bulk copy of the contiguous f64 slice into
             // a JS-owned Float64Array. No per-cell boxing, no Vec<Cell>.
-            Some(DatasetValue::Numbers(nums)) => {
-                js_sys::Float64Array::from(nums.as_slice()).into()
-            }
+            Some(DatasetValue::Numbers(nums)) => js_sys::Float64Array::from(nums.as_slice()).into(),
             // Mixed dense array: numbers + strings + nulls.
             Some(DatasetValue::Cells(arr)) => cells_slice_to_js(arr),
             // Sparse object: materialize the dense form once, then emit. The
@@ -1696,8 +1694,8 @@ impl JSONstat {
             let size_d = sizes[dim_idx];
             let mut idx_buf = vec![0u32; total];
             if size_d > 0 {
-                for row in 0..total {
-                    idx_buf[row] = ((row / stride) % size_d) as u32;
+                for (row, slot) in idx_buf.iter_mut().enumerate() {
+                    *slot = ((row / stride) % size_d) as u32;
                 }
             }
             let col_obj = js_sys::Object::new();
@@ -1728,8 +1726,7 @@ impl JSONstat {
 
         // Assemble the payload object.
         let payload = js_sys::Object::new();
-        let _ =
-            js_sys::Reflect::set(&payload, &JsValue::from_str("__columnar"), &JsValue::TRUE);
+        let _ = js_sys::Reflect::set(&payload, &JsValue::from_str("__columnar"), &JsValue::TRUE);
         let _ = js_sys::Reflect::set(
             &payload,
             &JsValue::from_str("n"),
