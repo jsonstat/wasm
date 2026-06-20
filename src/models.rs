@@ -256,6 +256,8 @@ impl Cell {
 ///   enum-tagged [`Cell`] representation so non-numeric values survive.
 /// - [`DatasetValue::Sparse`] — a JSON-stat 2.0 sparse object keyed by the
 ///   decimal flat index (`{"0": 10, "3": 40}`). Missing keys read as `null`.
+///   Stored as [`SparseValues`] — sorted parallel vectors, not a `HashMap`, so
+///   construction does not hash N string keys and reads are a binary search.
 ///
 /// # Precision note
 /// Integer values larger than 2⁵³ (~9 quadrillion) lose precision when stored
@@ -269,8 +271,101 @@ pub enum DatasetValue {
     Numbers(Vec<f64>),
     /// Dense array mixing numbers/strings/nulls.
     Cells(Vec<Cell>),
-    /// Sparse object keyed by decimal flat index (JSON-stat 2.0 form).
-    Sparse(HashMap<String, Cell>),
+    /// Sparse object keyed by decimal flat index (JSON-stat 2.0 form),
+    /// stored as sorted parallel vectors ([`SparseValues`]).
+    Sparse(SparseValues),
+}
+
+// ── SparseValues ───────────────────────────────────────────────────────────
+
+/// Sorted parallel-vector store for a JSON-stat 2.0 sparse `value` object.
+///
+/// Replaces the old `HashMap<String, Cell>`: keys are decimal flat indices
+/// (`"0"`, `"3"`, …) parsed to `usize` once at build time and kept sorted, so
+/// reads are a cache-friendly binary search (no hashing, no allocation) and
+/// construction does not hash N string keys. Built straight from the serde
+/// `MapAccess` (string path) or from parallel JS typed arrays (object-input
+/// fast path).
+#[derive(Debug, Clone)]
+pub struct SparseValues {
+    /// Flat indices, sorted ascending.
+    indices: Vec<usize>,
+    /// Cells parallel to [`Self::indices`].
+    cells: Vec<Cell>,
+}
+
+impl SparseValues {
+    /// Build from `(flat-index, cell)` pairs, sorting once by index. Duplicate
+    /// indices keep their last-seen order (JSON-stat sparse keys are unique, so
+    /// this is defensive only).
+    pub fn from_entries(mut entries: Vec<(usize, Cell)>) -> Self {
+        entries.sort_unstable_by_key(|(i, _)| *i);
+        let n = entries.len();
+        let mut indices = Vec::with_capacity(n);
+        let mut cells = Vec::with_capacity(n);
+        for (i, c) in entries {
+            indices.push(i);
+            cells.push(c);
+        }
+        Self { indices, cells }
+    }
+
+    /// Build from parallel `indices` + numeric `values` produced by the JS
+    /// facade's typed-array pre-flight. Re-sorted here by index so downstream
+    /// serialization is stable regardless of JS object enumeration order.
+    /// Whole-valued f64s become integer [`Cell::Number`]s so `ToJSON()` emits
+    /// `10` (not `10.0`), matching the string-parse path byte-for-byte.
+    pub fn from_parallel(indices: Vec<usize>, values: Vec<f64>) -> Self {
+        debug_assert_eq!(indices.len(), values.len());
+        let mut order: Vec<usize> = (0..indices.len()).collect();
+        order.sort_unstable_by_key(|&i| indices[i]);
+        let mut idx_out = Vec::with_capacity(indices.len());
+        let mut cells = Vec::with_capacity(indices.len());
+        for pos in order {
+            idx_out.push(indices[pos]);
+            let v = values[pos];
+            cells.push(number_cell_from_f64(v));
+        }
+        Self {
+            indices: idx_out,
+            cells,
+        }
+    }
+
+    /// Number of present entries.
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// Borrow the cell at `index`, or `None` if absent. Binary search over the
+    /// sorted indices — O(log N), no hashing, no allocation.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&Cell> {
+        self.indices
+            .binary_search(&index)
+            .ok()
+            .map(|p| &self.cells[p])
+    }
+
+    /// Iterate `(flat-index, &Cell)` in ascending index order.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &Cell)> {
+        self.indices.iter().copied().zip(self.cells.iter())
+    }
+}
+
+/// Build a [`Cell::Number`] from an `f64`, preserving the integer form of
+/// whole values (so serialization emits `10`, not `10.0`). Mirrors the integer
+/// rule of [`DatasetValue::Numbers`]'s `Serialize` impl.
+fn number_cell_from_f64(v: f64) -> Cell {
+    if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+        Cell::Number(serde_json::Number::from(v as i64))
+    } else {
+        Cell::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)))
+    }
 }
 
 impl DatasetValue {
@@ -291,13 +386,7 @@ impl DatasetValue {
                 })
                 .unwrap_or(Cell::Null),
             Self::Cells(arr) => arr.get(index).cloned().unwrap_or(Cell::Null),
-            Self::Sparse(map) => {
-                // Allocation-free decimal key lookup (sparse value object).
-                let mut buf = [0u8; 20];
-                map.get(crate::query::usize_key(&mut buf, index))
-                    .cloned()
-                    .unwrap_or(Cell::Null)
-            }
+            Self::Sparse(sparse) => sparse.get(index).cloned().unwrap_or(Cell::Null),
         }
     }
 
@@ -310,11 +399,7 @@ impl DatasetValue {
         match self {
             Self::Numbers(nums) => nums.get(index).copied(),
             Self::Cells(arr) => arr.get(index).and_then(|c| c.as_f64()),
-            Self::Sparse(map) => {
-                let mut buf = [0u8; 20];
-                map.get(crate::query::usize_key(&mut buf, index))
-                    .and_then(|c| c.as_f64())
-            }
+            Self::Sparse(sparse) => sparse.get(index).and_then(|c| c.as_f64()),
         }
     }
 
@@ -334,7 +419,7 @@ impl DatasetValue {
         match self {
             Self::Numbers(nums) => nums.len(),
             Self::Cells(arr) => arr.len(),
-            Self::Sparse(map) => map.len(),
+            Self::Sparse(sparse) => sparse.len(),
         }
     }
 
@@ -404,11 +489,18 @@ impl<'de> serde::de::Visitor<'de> for DatasetValueVisitor {
     where
         A: serde::de::MapAccess<'de>,
     {
-        let mut out: HashMap<String, Cell> = HashMap::new();
+        // Collect (flat-index, cell) pairs, then build the sorted parallel-
+        // vector store in one shot. Keys are decimal flat indices ("0", "3", …);
+        // non-numeric keys are skipped (they can never be addressed by a flat
+        // index lookup, matching the prior HashMap behavior where they were
+        // simply dead entries). This avoids hashing N string keys.
+        let mut entries: Vec<(usize, Cell)> = Vec::new();
         while let Some((k, v)) = map.next_entry::<String, Cell>()? {
-            out.insert(k, v);
+            if let Ok(idx) = k.parse::<usize>() {
+                entries.push((idx, v));
+            }
         }
-        Ok(DatasetValue::Sparse(out))
+        Ok(DatasetValue::Sparse(SparseValues::from_entries(entries)))
     }
 }
 
@@ -426,7 +518,7 @@ impl serde::Serialize for DatasetValue {
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeSeq;
+        use serde::ser::{SerializeMap, SerializeSeq};
         match self {
             DatasetValue::Numbers(nums) => {
                 let mut seq = serializer.serialize_seq(Some(nums.len()))?;
@@ -444,7 +536,16 @@ impl serde::Serialize for DatasetValue {
                 seq.end()
             }
             DatasetValue::Cells(cells) => cells.serialize(serializer),
-            DatasetValue::Sparse(map) => map.serialize(serializer),
+            DatasetValue::Sparse(sparse) => {
+                let mut m = serializer.serialize_map(Some(sparse.len()))?;
+                let mut buf = [0u8; 20];
+                for (idx, cell) in sparse.iter() {
+                    // Decimal-index string key, allocation-free via the shared
+                    // helper shared with the sparse read path.
+                    m.serialize_entry(crate::query::usize_key(&mut buf, idx), cell)?;
+                }
+                m.end()
+            }
         }
     }
 }

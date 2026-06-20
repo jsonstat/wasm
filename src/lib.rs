@@ -3,7 +3,7 @@ pub mod query;
 
 use models::{
     Cell, Collection, CollectionItem, Dataset, DatasetValue, Dimension, DimensionResponse,
-    JsonStatResponse,
+    JsonStatResponse, SparseValues,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -101,6 +101,86 @@ fn response_from_js_value(js: JsValue) -> Result<JsonStatResponse, JsValue> {
         other => return Err(JsValue::from_str(&format!("Unknown class: '{}'", other))),
     };
     result.map_err(|e| JsValue::from_str(&format!("Failed to parse JSON-stat: {}", e)))
+}
+
+// ── Object-input fast path helpers (v0.4.0) ───────────────────────────────
+//
+// `from_object` deserializes an already-parsed JS object via
+// `serde_wasm_bindgen::from_value`, which walks the `value` array one
+// `Reflect::get` per cell — the dominant cost of `JSONstat(obj)` (2–6× slower
+// than the JS toolkit on large datasets). The fast path instead bulk-copies
+// the `value` payload from a typed array the JS facade prepares (one boundary
+// crossing + one memcpy), and serde-walks only the small metadata.
+
+/// Shallow-copy a JS object's own enumerable properties into a fresh `Object`,
+/// skipping the named key. Properties are copied by reference (shallow), so
+/// nested objects (`dimension`, `role`, …) are shared with the source until
+/// serde walks and owns them — no deep clone. Used to hand serde a metadata
+/// object with the (huge) `value` field stripped, so serde never walks it.
+fn shallow_copy_without(js: &JsValue, skip: &str) -> Result<js_sys::Object, JsValue> {
+    let out = js_sys::Object::new();
+    // `Object::keys` needs a `&Object`; the input is always an object here.
+    let obj: &js_sys::Object = js
+        .dyn_ref()
+        .ok_or_else(|| JsValue::from_str("JSON-stat input must be an object"))?;
+    let keys = js_sys::Object::keys(obj);
+    let len = keys.length();
+    for i in 0..len {
+        let key = keys.get(i);
+        if key.as_string().as_deref() == Some(skip) {
+            continue;
+        }
+        let val = js_sys::Reflect::get(js, &key)?;
+        let _ = js_sys::Reflect::set(&out, &key, &val);
+    }
+    Ok(out)
+}
+
+/// Build a [`Dataset`] from a JS object, taking the `value` payload from a
+/// pre-built [`DatasetValue`] instead of serde-walking it element by element.
+/// The rest of the metadata is serde-deserialized from a shallow copy of the
+/// object with `value` stripped, so the large `value` array never crosses the
+/// serde boundary one element at a time.
+fn dataset_from_js_with_value(js: &JsValue, value: DatasetValue) -> Result<Dataset, JsValue> {
+    let meta = shallow_copy_without(js, "value")?;
+    let mut dataset: Dataset = serde_wasm_bindgen::from_value(meta.into())
+        .map_err(|e| JsValue::from_str(&format!("Failed to parse JSON-stat: {}", e)))?;
+    dataset.value = Some(value);
+    Ok(dataset)
+}
+
+/// Materialize the `value` payload from the facade's typed-array descriptor.
+///
+/// Descriptor shape (produced by `describeValue` in the JS facade):
+/// - `{ kind: "dense", data: Float64Array }` → [`DatasetValue::Numbers`]
+/// - `{ kind: "sparse", indices: Uint32Array, data: Float64Array }` →
+///   [`DatasetValue::Sparse`]
+///
+/// Returns `None` for any other shape so the caller falls back to the serde
+/// [`JSONstat::from_object`] path.
+fn value_from_descriptor(desc: &JsValue) -> Option<DatasetValue> {
+    let kind = js_sys::Reflect::get(desc, &JsValue::from_str("kind"))
+        .ok()
+        .and_then(|v| v.as_string())?;
+    match kind.as_str() {
+        "dense" => {
+            let data = js_sys::Reflect::get(desc, &JsValue::from_str("data")).ok()?;
+            let arr = data.dyn_into::<js_sys::Float64Array>().ok()?;
+            Some(DatasetValue::Numbers(arr.to_vec()))
+        }
+        "sparse" => {
+            let idx_js = js_sys::Reflect::get(desc, &JsValue::from_str("indices")).ok()?;
+            let data_js = js_sys::Reflect::get(desc, &JsValue::from_str("data")).ok()?;
+            let idx_arr = idx_js.dyn_into::<js_sys::Uint32Array>().ok()?;
+            let data_arr = data_js.dyn_into::<js_sys::Float64Array>().ok()?;
+            let indices: Vec<usize> = idx_arr.to_vec().into_iter().map(|u| u as usize).collect();
+            let values = data_arr.to_vec();
+            Some(DatasetValue::Sparse(SparseValues::from_parallel(
+                indices, values,
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// Materialize a slice of cells into a JS array, with a **Float64Array fast
@@ -607,6 +687,48 @@ impl JSONstat {
     /// `JSONstat(obj)`. Exposed as the static method `JSONstat.fromObject()`.
     #[wasm_bindgen(js_name = "fromObject")]
     pub fn from_object(js: JsValue) -> Result<JSONstat, JsValue> {
+        let response = response_from_js_value(js)?;
+        Ok(JSONstat {
+            response,
+            cached_value: RefCell::new(None),
+        })
+    }
+
+    /// v0.4.0 object-input **typed-array fast path**.
+    ///
+    /// Like [`JSONstat::from_object`], but takes the `value` payload from a
+    /// pre-flight typed-array descriptor so the (often huge) value array is
+    /// bulk-copied in one shot instead of being `serde-wasm-bindgen`-walked one
+    /// `Reflect::get` per cell — the change that turns `JSONstat(obj)` from the
+    /// slowest phase into a winning one on medium/large datasets.
+    ///
+    /// The JS facade (`describeValue` + `JSONstat`) only calls this when it can
+    /// classify `value` as numeric-dense or numeric-sparse; mixed/absent/odd
+    /// shapes fall back to [`JSONstat::from_object`] (the serde path). Exposed
+    /// as `_fromObjectFast` (underscore-prefixed: an internal fast path, not
+    /// part of the toolkit-compatible public surface).
+    #[wasm_bindgen(js_name = "_fromObjectFast")]
+    pub fn from_object_fast(js: JsValue, value_desc: JsValue) -> Result<JSONstat, JsValue> {
+        let class = js_sys::Reflect::get(&js, &JsValue::from_str("class"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "dataset".to_string());
+
+        // Only datasets carry the large `value` array worth optimizing; and
+        // only when the facade produced a usable typed-array descriptor.
+        if class == "dataset" {
+            if let Some(value) = value_from_descriptor(&value_desc) {
+                let dataset = dataset_from_js_with_value(&js, value)?;
+                return Ok(JSONstat {
+                    response: JsonStatResponse::Dataset(dataset),
+                    cached_value: RefCell::new(None),
+                });
+            }
+        }
+
+        // Non-dataset classes, or an unclassifiable value: the original serde
+        // path. These carry no large value array, so there is nothing to
+        // optimize — `from_object` already handles them correctly.
         let response = response_from_js_value(js)?;
         Ok(JSONstat {
             response,
@@ -3191,6 +3313,58 @@ mod tests {
 
         let values = dataset.value.as_ref().unwrap();
         assert_eq!(values.get_at(flat).as_f64(), Some(2.0));
+    }
+
+    // ── v0.4.0: SparseValues parallel-vector storage ───────────────────────
+
+    /// The object-input fast path builds sparse values from parallel typed
+    /// arrays ([`SparseValues::from_parallel`]); the string path builds from
+    /// parsed entries ([`SparseValues::from_entries`]). Both must read
+    /// identically and serialize to the same JSON-stat 2.0 sparse object — the
+    /// guarantee that the two parse routes are interchangeable.
+    #[test]
+    fn test_sparse_parallel_matches_entries() {
+        use crate::models::SparseValues;
+        // Indices handed to from_parallel UNSORTED, to confirm it sorts.
+        let parallel = SparseValues::from_parallel(vec![5, 0, 2], vec![60.0, 10.0, 30.0]);
+        let entries = SparseValues::from_entries(vec![
+            (0, Cell::Number(serde_json::Number::from(10i64))),
+            (2, Cell::Number(serde_json::Number::from(30i64))),
+            (5, Cell::Number(serde_json::Number::from(60i64))),
+        ]);
+        for idx in 0..6 {
+            assert_eq!(
+                parallel.get(idx).cloned(),
+                entries.get(idx).cloned(),
+                "idx {idx} mismatch"
+            );
+        }
+        assert!(parallel.get(1).is_none());
+        assert!(parallel.get(3).is_none());
+        assert!(parallel.get(4).is_none());
+        assert_eq!(parallel.len(), 3);
+
+        // Whole-valued f64s serialize back as integers (mirroring the string
+        // path's integer parse), so ToJSON stays byte-stable across routes.
+        let sp = serde_json::to_string(&DatasetValue::Sparse(parallel)).unwrap();
+        assert_eq!(sp, "{\"0\":10,\"2\":30,\"5\":60}");
+    }
+
+    /// `get_at` / `get_f64` on a sparse [`DatasetValue`] built via the serde
+    /// (string) path still return the right cell and `null` for absent keys —
+    /// the regression guard for the `HashMap` → [`SparseValues`] swap.
+    #[test]
+    fn test_sparse_datasetvalue_reads_after_rework() {
+        let dv: DatasetValue = serde_json::from_str(r#"{"0": 10.0, "3": 40.0}"#).unwrap();
+        assert_eq!(dv.get_at(0).as_f64(), Some(10.0));
+        assert!(dv.get_at(1).is_null());
+        assert!(dv.get_at(2).is_null());
+        assert_eq!(dv.get_at(3).as_f64(), Some(40.0));
+        assert_eq!(dv.get_f64(0), Some(10.0));
+        assert_eq!(dv.get_f64(3), Some(40.0));
+        assert_eq!(dv.len(), 2);
+        // Out-of-range / absent reads as null, not a panic.
+        assert!(dv.get_at(99).is_null());
     }
 
     #[test]

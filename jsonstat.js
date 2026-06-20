@@ -186,6 +186,59 @@ function wrapDataset(instance) {
     });
 }
 
+// ── Object-input value pre-flight (v0.4.0) ─────────────────────────────────
+//
+// `fromObject` deserializes a JS object via serde-wasm-bindgen, which walks the
+// `value` array one `Reflect::get` per cell — the dominant cost of
+// `JSONstat(obj)` (2–6× slower than the JS toolkit on large datasets). This
+// helper inspects `value` ONCE on the JS side and, for the common numeric
+// cases, coerces it into typed arrays that Rust bulk-copies in one shot (one
+// boundary crossing + one memcpy). Mixed / absent / odd shapes return null and
+// take the original serde `fromObject` path unchanged.
+//
+// Descriptor shapes consumed by Rust `_fromObjectFast`:
+//   { kind: 'dense',  data: Float64Array }                      // numeric dense
+//   { kind: 'sparse', indices: Uint32Array, data: Float64Array } // numeric sparse
+function describeValue(value) {
+    if (Array.isArray(value)) {
+        // Numeric dense. `new Float64Array(arr)` silently coerces non-numbers
+        // (null -> 0, '' -> 0, 'x' -> NaN), so verify every element is a real
+        // number first — a `null` cell is a legitimate JSON-stat value and must
+        // NOT be turned into 0. Coercion itself is a native V8 op (fast).
+        let allNum = true;
+        for (let i = 0; i < value.length; i++) {
+            if (typeof value[i] !== 'number') { allNum = false; break; }
+        }
+        if (allNum) return { kind: 'dense', data: new Float64Array(value) };
+        return null; // mixed dense -> serde
+    }
+    if (value && typeof value === 'object' && !ArrayBuffer.isView(value)) {
+        // JSON-stat 2.0 sparse object keyed by the decimal flat index.
+        const keys = Object.keys(value);
+        const n = keys.length;
+        const indices = new Uint32Array(n);
+        const data = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+            const v = value[keys[i]];
+            if (typeof v !== 'number') return null; // sparse-mixed -> serde
+            const idx = Number(keys[i]);
+            if (!Number.isInteger(idx) || idx < 0) return null; // non-decimal key
+            indices[i] = idx;
+            data[i] = v;
+        }
+        return { kind: 'sparse', indices, data };
+    }
+    return null;
+}
+
+// Route an object input through the typed-array fast path when possible,
+// otherwise through the serde `fromObject` path. MUST be awaited (WASM init).
+function buildFromObject(input) {
+    const desc = describeValue(input && input.value);
+    if (desc) return _JSONstat._fromObjectFast(input, desc);
+    return _JSONstat.fromObject(input);
+}
+
 /**
  * Creates a jsonstat instance from an external input.
  *
@@ -250,14 +303,13 @@ export function JSONstat(input, options) {
         })();
     }
 
-    // JSON-stat object: pass straight into WASM. `fromObject` deserializes
-    // the JS object directly into the Rust model via serde-wasm-bindgen,
-    // avoiding the JSON.stringify + re-parse round-trip. V8's native
-    // JSON.parse (which already produced this object) is faster than
-    // serde_json, so we let the JS engine own the lexing and traverse the
-    // object only once on the Rust side.
+    // JSON-stat object. v0.4.0: when `value` is numeric (dense or sparse),
+    // `buildFromObject` coerces it into typed arrays that Rust bulk-copies in
+    // one shot (`_fromObjectFast`), instead of `serde-wasm-bindgen`-walking it
+    // one `Reflect::get` per cell. Mixed / absent / odd `value` shapes fall
+    // back to the serde `fromObject` path unchanged.
     return (async () => {
         await ready;
-        return wrapDataset(_JSONstat.fromObject(input));
+        return wrapDataset(buildFromObject(input));
     })();
 }

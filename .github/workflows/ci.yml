@@ -33,7 +33,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Stable toolchain with the two extra pieces this crate needs:
       #   - rustfmt + clippy for the format/lint gates
@@ -84,9 +84,9 @@ jobs:
       # tsconfig.json checks pkg/**/*.d.ts, so this MUST run after the build.
       # TypeScript is pulled in via npx — no package.json dependency needed.
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Type-check bindings
         run: npx --yes -p typescript@5 tsc --noEmit

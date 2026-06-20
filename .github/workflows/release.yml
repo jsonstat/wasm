@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -70,16 +70,16 @@ jobs:
 
       # ── Publish to npm ───────────────────────────────────────────────────
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Type-check bindings
         run: npx --yes -p typescript@5 tsc --noEmit
 
-      # Trusted Publishing (OIDC) requires a recent npm CLI; Node 20 ships
-      # npm 10, which predates it. Upgrade before publishing.
+      # Trusted Publishing (OIDC) requires a recent npm CLI; the Node version
+      # pinned above may ship an npm that predates it. Upgrade before publishing.
       - name: Upgrade npm for Trusted Publishing
         run: npm install -g npm@latest
 
