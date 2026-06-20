@@ -5,6 +5,7 @@ use models::{
     Cell, Collection, CollectionItem, Dataset, DatasetValue, Dimension, DimensionResponse,
     JsonStatResponse,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -30,6 +31,18 @@ pub fn version() -> String {
 #[wasm_bindgen]
 pub struct JSONstat {
     response: JsonStatResponse,
+    /// Cached materialization of the `value` getter. `value()` bulk-copies the
+    /// dataset values into a JS `Float64Array`/`Array` on first access and
+    /// returns the same `JsValue` on every subsequent call — turning the O(N)
+    /// per-call materialization into an O(N)-once + O(1)-after cost.
+    ///
+    /// Safety of caching: the dataset is immutable for the instance's lifetime
+    /// (no method mutates `response`), `Float64Array::from(&[f64])` copies the
+    /// bytes out of WASM linear memory into JS-owned memory (so there is no
+    /// dangling view into relocatable WASM memory), and `Dice()` constructs a
+    /// **new** `JSONstat` (fresh empty cache). Single-threaded WASM ⇒ a plain
+    /// `RefCell` is sufficient (no `Mutex` overhead).
+    cached_value: RefCell<Option<JsValue>>,
 }
 
 // ── Private Helpers ───────────────────────────────────────────────────────
@@ -580,7 +593,10 @@ impl JSONstat {
     pub fn new(json_str: &str) -> Result<JSONstat, JsValue> {
         let response = JsonStatResponse::from_json_str(json_str)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse JSON-stat: {}", e)))?;
-        Ok(JSONstat { response })
+        Ok(JSONstat {
+            response,
+            cached_value: RefCell::new(None),
+        })
     }
 
     /// Parses a JSON-stat **object** (already parsed by the JS engine) into a
@@ -592,7 +608,10 @@ impl JSONstat {
     #[wasm_bindgen(js_name = "fromObject")]
     pub fn from_object(js: JsValue) -> Result<JSONstat, JsValue> {
         let response = response_from_js_value(js)?;
-        Ok(JSONstat { response })
+        Ok(JSONstat {
+            response,
+            cached_value: RefCell::new(None),
+        })
     }
 
     // ── Property Getters ──────────────────────────────────────────────
@@ -798,15 +817,34 @@ impl JSONstat {
     /// required. Mixed (string/null) datasets still return a plain `Array`.
     #[wasm_bindgen(getter)]
     pub fn value(&self) -> JsValue {
+        // Cache hit: return the previously built Float64Array/Array. This makes
+        // repeated `ds.value` reads O(1) and makes `ds.value === ds.value` hold
+        // (documented behavior change in v0.3.0).
+        //
+        // The borrow is dropped at the end of this `if` block; the
+        // `borrow_mut()` further down therefore never overlaps it.
+        {
+            let cache = self.cached_value.borrow();
+            if let Some(cached) = cache.as_ref() {
+                return cached.clone();
+            }
+        }
         let dataset = match require_dataset(&self.response) {
             Ok(d) => d,
             Err(_) => return JsValue::NULL,
         };
-        match &dataset.value {
-            Some(DatasetValue::Array(arr)) => cells_slice_to_js(arr),
-            Some(value @ DatasetValue::Map(_)) => {
-                // Convert sparse map to dense, then apply the same
-                // Float64Array fast path.
+        let js = match &dataset.value {
+            // Numbers fast path: one bulk copy of the contiguous f64 slice into
+            // a JS-owned Float64Array. No per-cell boxing, no Vec<Cell>.
+            Some(DatasetValue::Numbers(nums)) => {
+                js_sys::Float64Array::from(nums.as_slice()).into()
+            }
+            // Mixed dense array: numbers + strings + nulls.
+            Some(DatasetValue::Cells(arr)) => cells_slice_to_js(arr),
+            // Sparse object: materialize the dense form once, then emit. The
+            // Float64Array fast path still applies if every present value is
+            // numeric (cells_slice_to_js picks it).
+            Some(value) => {
                 let len: usize = dataset
                     .size
                     .as_ref()
@@ -816,7 +854,9 @@ impl JSONstat {
                 cells_slice_to_js(&cells)
             }
             None => JsValue::NULL,
-        }
+        };
+        *self.cached_value.borrow_mut() = Some(js.clone());
+        js
     }
 
     // ── Value Access ──────────────────────────────────────────────────
@@ -837,12 +877,22 @@ impl JSONstat {
 
         let flat_index = resolve_flat_index(dataset, &query).map_err(|e| JsValue::from_str(&e))?;
 
-        if let DatasetValue::Array(arr) = value {
-            if flat_index >= arr.len() {
-                return Err(JsValue::from_str(
-                    "Calculated index is out of bounds for value array",
-                ));
-            }
+        // Bounds check across all storage variants. Sparse storage bounds
+        // against the product of sizes (a missing key is a valid `null`, not an
+        // out-of-range error).
+        let total = match value {
+            DatasetValue::Numbers(nums) => nums.len(),
+            DatasetValue::Cells(arr) => arr.len(),
+            DatasetValue::Sparse(_) => dataset
+                .size
+                .as_ref()
+                .map(|s| s.iter().product())
+                .unwrap_or(0),
+        };
+        if flat_index >= total {
+            return Err(JsValue::from_str(
+                "Calculated index is out of bounds for value array",
+            ));
         }
 
         Ok(cell_to_js(&value.get_at(flat_index)))
@@ -1540,6 +1590,164 @@ impl JSONstat {
         to_js_value_result(&result)
     }
 
+    /// Columnar fast path for `Transform({type:'arrobj'})` (no `by`, no `meta`).
+    ///
+    /// Instead of building one `serde_json::Value::Object` per cell and then
+    /// re-walking the whole tree through `serde-wasm-bindgen` at the boundary
+    /// (a per-cell `Map` allocation plus a per-field `Reflect::get`), this
+    /// emits a **columnar** payload that a thin JS assembler turns into the
+    /// row-object array using a V8-JIT'd object literal — so the per-cell cost
+    /// collapses to one typed-array read per column inside a JIT'd loop.
+    ///
+    /// The JS facade intercepts `Transform({type:'arrobj'})` and routes it here
+    /// when `by`, `meta`, and `comma` are unset; every other option shape falls
+    /// back to the serde-based [`JSONstat::transform`].
+    ///
+    /// # Payload shape
+    /// A plain JS object:
+    /// ```text
+    /// {
+    ///   __columnar: true,
+    ///   n: <row count>,                              // product of sizes
+    ///   names: ["d0", "d1", ..., "value"],           // column names in order
+    ///   cols: [
+    ///     { kind: "enum",   uniques: [...], indices: Uint32Array }, // dim column
+    ///     ...
+    ///     { kind: "number", data: Float64Array },    // numeric value column
+    ///     // or { kind: "cells", data: Array }       // mixed / comma value column
+    ///     // or { kind: "cells", data: Array }       // status column (if status:true)
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Dimension columns are emitted as a small `uniques` string array (the
+    /// distinct category labels/ids, length `sizes[d]`) plus a `Uint32Array`
+    /// of row→category-position indices — so the N repeated strings are created
+    /// **once** on the JS side, not pushed across the boundary N times.
+    #[wasm_bindgen(js_name = "_transformColumns")]
+    pub fn transform_columns(&self, opts_js: Option<JsValue>) -> Result<JsValue, JsValue> {
+        let dataset = require_dataset(&self.response)?;
+        let dim_ids = dataset
+            .id
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'id' array"))?;
+        let sizes = dataset
+            .size
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'size' array"))?;
+        let dimensions = dataset
+            .dimension
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset is missing 'dimension' object"))?;
+        let values = dataset
+            .value
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Dataset has no values"))?;
+
+        let opts: TransformOpts = match opts_js {
+            Some(js) => serde_wasm_bindgen::from_value(js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid transform options: {}", e)))?,
+            None => TransformOpts::default(),
+        };
+        let content = opts.content.as_deref().unwrap_or("label");
+        let field = opts.field.as_deref().unwrap_or("id");
+        let vlabel = opts.vlabel.as_deref().unwrap_or("Value");
+        let slabel = opts.slabel.as_deref().unwrap_or("Status");
+        let include_status = opts.status.unwrap_or(false);
+        let comma = opts.comma.unwrap_or(false);
+        let drop = opts.drop.unwrap_or_default();
+
+        let total: usize = sizes.iter().product();
+        let strides = query::strides(sizes);
+
+        // Included dimensions (respect `drop`).
+        let included: Vec<usize> = dim_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !drop.contains(id))
+            .map(|(i, _)| i)
+            .collect();
+
+        let ncols = included.len() + 1 + if include_status { 1 } else { 0 };
+        let mut col_names: Vec<String> = Vec::with_capacity(ncols);
+        let mut col_datas: Vec<JsValue> = Vec::with_capacity(ncols);
+
+        // Dimension columns: emit as enum (uniques + Uint32Array indices).
+        for &dim_idx in &included {
+            let dim_id = &dim_ids[dim_idx];
+            let dim = match dimensions.get(dim_id) {
+                Some(d) => d,
+                None => continue,
+            };
+            let name = get_column_name(dim_id, field, dimensions);
+            // Distinct value per category position (label or id).
+            let cat_ids = category_ids_of(dim);
+            let uniques_arr = js_sys::Array::new();
+            for cat_id in &cat_ids {
+                let v = if content == "label" {
+                    category_label_for(dim, cat_id)
+                } else {
+                    cat_id.clone()
+                };
+                uniques_arr.push(&JsValue::from_str(&v));
+            }
+            // Row → category position for this dimension: (row / stride) % size.
+            let stride = strides[dim_idx];
+            let size_d = sizes[dim_idx];
+            let mut idx_buf = vec![0u32; total];
+            if size_d > 0 {
+                for row in 0..total {
+                    idx_buf[row] = ((row / stride) % size_d) as u32;
+                }
+            }
+            let col_obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &col_obj,
+                &JsValue::from_str("kind"),
+                &JsValue::from_str("enum"),
+            );
+            let _ = js_sys::Reflect::set(&col_obj, &JsValue::from_str("uniques"), &uniques_arr);
+            let _ = js_sys::Reflect::set(
+                &col_obj,
+                &JsValue::from_str("indices"),
+                &js_sys::Uint32Array::from(&idx_buf[..]).into(),
+            );
+            col_names.push(name);
+            col_datas.push(col_obj.into());
+        }
+
+        // Value column.
+        col_names.push(get_value_key(field, vlabel));
+        col_datas.push(columnar_value_column(values, total, comma));
+
+        // Status column (optional).
+        if include_status {
+            col_names.push(get_status_key(field, slabel));
+            col_datas.push(columnar_status_column(dataset, total));
+        }
+
+        // Assemble the payload object.
+        let payload = js_sys::Object::new();
+        let _ =
+            js_sys::Reflect::set(&payload, &JsValue::from_str("__columnar"), &JsValue::TRUE);
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("n"),
+            &JsValue::from_f64(total as f64),
+        );
+        let names_arr = js_sys::Array::new();
+        for name in &col_names {
+            names_arr.push(&JsValue::from_str(name));
+        }
+        let _ = js_sys::Reflect::set(&payload, &JsValue::from_str("names"), &names_arr);
+        let cols_arr = js_sys::Array::new();
+        for data in &col_datas {
+            cols_arr.push(data);
+        }
+        let _ = js_sys::Reflect::set(&payload, &JsValue::from_str("cols"), &cols_arr);
+        Ok(payload.into())
+    }
+
     // ── Dice() ────────────────────────────────────────────────────────
 
     /// Filters a dataset keeping only the specified dimension categories.
@@ -1569,6 +1777,7 @@ impl JSONstat {
 
         Ok(JSONstat {
             response: JsonStatResponse::Dataset(new_dataset),
+            cached_value: RefCell::new(None),
         })
     }
 
@@ -1871,6 +2080,23 @@ fn dice_dataset(
         }
     }
 
+    // Promote the diced values to the Numbers fast path when every kept cell is
+    // numeric, so the diced dataset re-enters the zero-copy value/Transform
+    // paths. Mixed datasets fall back to Cells.
+    let new_value = if new_values.iter().all(|c| matches!(c, Cell::Number(_))) {
+        DatasetValue::Numbers(
+            new_values
+                .iter()
+                .map(|c| match c {
+                    Cell::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+                    _ => unreachable!("guarded by the `all` check above"),
+                })
+                .collect(),
+        )
+    } else {
+        DatasetValue::Cells(new_values)
+    };
+
     // Build new dataset. Only metadata is cloned; the original (potentially
     // huge) `value`/`status` arrays are NOT cloned — they are replaced by the
     // freshly built subsets above.
@@ -1884,7 +2110,7 @@ fn dice_dataset(
         id: dataset.id.clone(),
         size: Some(new_sizes),
         dimension: Some(new_dimensions),
-        value: Some(DatasetValue::Array(new_values)),
+        value: Some(new_value),
         status: if has_status {
             Some(serde_json::Value::Array(new_status))
         } else {
@@ -2021,6 +2247,101 @@ fn format_cell(cell: &Cell, comma: bool) -> serde_json::Value {
     } else {
         cell.to_json_value()
     }
+}
+
+/// Build the value column for the columnar Transform payload.
+///
+/// All-numeric datasets (`Numbers`, or a `Cells`/`Sparse` variant where every
+/// present cell is numeric) emit a single `Float64Array` — a contiguous bulk
+/// copy with no per-cell boxing, the same fast path the `value` getter uses.
+/// Absent sparse values are emitted as `NaN`, which the JS assembler maps back
+/// to `null` to match the serde path's JSON-stat semantics.
+///
+/// Mixed-value datasets (or `comma:true`, which forces numbers to formatted
+/// strings) fall back to a plain JS `Array` built with one `cell_to_js` per
+/// row — still cheaper than the serde path because it skips the
+/// `serde_json::Value` tree and the boundary re-walk.
+fn columnar_value_column(values: &DatasetValue, total: usize, comma: bool) -> JsValue {
+    // Every column is emitted as a `{kind, data}` object so the JS assembler
+    // can branch uniformly. The numeric fast path still uses a single bulk
+    // `Float64Array::from` (zero per-cell boxing) — only a thin wrapper object
+    // is added, allocated once per call (not per cell).
+    //
+    // Bulk-copy fast path: all-numeric, no comma formatting.
+    if !comma {
+        if let Some(nums) = values.as_numbers() {
+            let col_obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &col_obj,
+                &JsValue::from_str("kind"),
+                &JsValue::from_str("number"),
+            );
+            // The Numbers slice carries the full dense length; guard defensively
+            // against a truncated slice by padding with NaN (the JS assembler
+            // maps NaN → null).
+            let data: JsValue = if nums.len() == total {
+                js_sys::Float64Array::from(nums).into()
+            } else {
+                let mut buf = nums.to_vec();
+                buf.resize(total, f64::NAN);
+                js_sys::Float64Array::from(&buf[..]).into()
+            };
+            let _ = js_sys::Reflect::set(&col_obj, &JsValue::from_str("data"), &data);
+            return col_obj.into();
+        }
+    }
+
+    // Mixed-value (or comma-formatted) fallback: plain JS array of cell JS
+    // values, one `cell_to_js` per row. Still cheaper than the serde path
+    // because it skips the `serde_json::Value` tree and the boundary re-walk.
+    let col_obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &col_obj,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("cells"),
+    );
+    // NOTE: `Array::new()` + `push` (not `new_with_length`). `push` appends
+    // past pre-allocated empty slots, so `new_with_length(n)` + n pushes would
+    // yield length 2n with the first n slots empty — and the assembler would
+    // read `undefined`, which JSON.stringify silently drops from objects.
+    let data_arr = js_sys::Array::new();
+    if comma {
+        for i in 0..total {
+            let cell = values.get_at(i);
+            let js = match &cell {
+                Cell::Number(n) => JsValue::from_str(&n.to_string().replace('.', ",")),
+                _ => cell_to_js(&cell),
+            };
+            data_arr.push(&js);
+        }
+    } else {
+        for i in 0..total {
+            data_arr.push(&cell_to_js(&values.get_at(i)));
+        }
+    }
+    let _ = js_sys::Reflect::set(&col_obj, &JsValue::from_str("data"), &data_arr);
+    col_obj.into()
+}
+
+/// Build the status column for the columnar Transform payload, as a plain JS
+/// array of status values (strings / numbers / null). Uses [`status_at_js`]
+/// directly so each status cell crosses the boundary once with no serde re-walk
+/// and no `serde_json::Value` clone.
+fn columnar_status_column(dataset: &Dataset, total: usize) -> JsValue {
+    let col_obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &col_obj,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("cells"),
+    );
+    // `Array::new()` + `push`, NOT `new_with_length` (see the value-column
+    // note above for why pre-allocation + push corrupts the layout).
+    let data_arr = js_sys::Array::new();
+    for i in 0..total {
+        data_arr.push(&status_at_js(dataset, i));
+    }
+    let _ = js_sys::Reflect::set(&col_obj, &JsValue::from_str("data"), &data_arr);
+    col_obj.into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2773,6 +3094,75 @@ mod tests {
         assert!(values.get_at(1).is_null());
         assert!(values.get_at(2).is_null());
         assert_eq!(values.get_at(3).as_f64(), Some(40.0));
+    }
+
+    /// v0.3.0: an all-numeric dense value array deserializes directly into the
+    /// `Numbers(Vec<f64>)` fast-path variant (no per-cell boxing). This is the
+    /// backbone of the zero-copy `value()` getter and the columnar Transform.
+    #[test]
+    fn test_numbers_variant_all_numeric_dense() {
+        let json = r#"{
+            "version": "2.0", "class": "dataset", "label": "AllNum",
+            "id": ["x"], "size": [3],
+            "dimension": {"x": {"category": {"index": ["a","b","c"]}}},
+            "value": [1.0, 2.5, 3.0]
+        }"#;
+        let response: JsonStatResponse = serde_json::from_str(json).unwrap();
+        let dataset = match &response {
+            JsonStatResponse::Dataset(d) => d,
+            _ => panic!("Expected dataset"),
+        };
+        let values = dataset.value.as_ref().unwrap();
+        // Fast path: contiguous f64 slice.
+        assert_eq!(values.as_numbers(), Some(&[1.0, 2.5, 3.0][..]));
+        // get_at still works uniformly across variants.
+        assert_eq!(values.get_at(0).as_f64(), Some(1.0));
+        assert_eq!(values.get_at(2).as_f64(), Some(3.0));
+        assert_eq!(values.len(), 3);
+    }
+
+    /// v0.3.0: a dense array with a null or string falls back to `Cells`, not
+    /// `Numbers`, preserving mixed-type semantics.
+    #[test]
+    fn test_cells_variant_mixed_dense() {
+        let json = r#"{
+            "version": "2.0", "class": "dataset", "label": "Mixed",
+            "id": ["x"], "size": [3],
+            "dimension": {"x": {"category": {"index": ["a","b","c"]}}},
+            "value": [1.0, null, 3.0]
+        }"#;
+        let response: JsonStatResponse = serde_json::from_str(json).unwrap();
+        let dataset = match &response {
+            JsonStatResponse::Dataset(d) => d,
+            _ => panic!("Expected dataset"),
+        };
+        let values = dataset.value.as_ref().unwrap();
+        // Mixed → NOT the Numbers fast path.
+        assert_eq!(values.as_numbers(), None);
+        assert!(values.get_at(1).is_null());
+        assert_eq!(values.get_at(2).as_f64(), Some(3.0));
+    }
+
+    /// v0.3.0: every `DatasetValue` variant serializes back to a JSON array,
+    /// preserving the ToJSON wire format (no sparse-object leak). This is the
+    /// round-trip guarantee that `to_json()` / `JSON.stringify` stay stable.
+    #[test]
+    fn test_datasetvalue_serialize_always_array() {
+        use serde_json::json;
+        // Numbers (serde_json emits whole-number f64s without a trailing .0).
+        let nums: DatasetValue = serde_json::from_value(json!([1.5, 2.0, 3.5])).unwrap();
+        let s = serde_json::to_string(&nums).unwrap();
+        assert_eq!(s, "[1.5,2,3.5]");
+        // Cells (with null) → array.
+        let cells: DatasetValue = serde_json::from_value(json!([1.5, null, "x"])).unwrap();
+        let s = serde_json::to_string(&cells).unwrap();
+        assert_eq!(s, "[1.5,null,\"x\"]");
+        // Sparse map → preserved as the JSON-stat 2.0 sparse object form
+        // (round-trips byte-for-byte). This is intentional: the spec permits
+        // sparse objects as a value representation, so we don't expand them.
+        let sparse: DatasetValue = serde_json::from_value(json!({"0": 1.0, "2": 3.0})).unwrap();
+        let s = serde_json::to_string(&sparse).unwrap();
+        assert_eq!(s, "{\"0\":1.0,\"2\":3.0}");
     }
 
     #[test]

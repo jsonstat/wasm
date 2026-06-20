@@ -238,24 +238,213 @@ impl Cell {
 
 // ── DatasetValue ──────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(untagged)]
+/// The `value` payload of a JSON-stat dataset.
+///
+/// Three storage variants, picked **at parse time** to minimize per-cell cost
+/// on the hottest paths (parse, [`value`](crate::JSONstat::value), `Data()`,
+/// `Transform()`):
+///
+/// - [`DatasetValue::Numbers`] — **every** value is numeric. Stored as a flat
+///   `Vec<f64>`, the form that lets the `value` getter emit a single
+///   contiguous `Float64Array` (and lets `Transform` emit a numeric column
+///   with zero per-cell boxing). This is the overwhelmingly common case for
+///   statistical datasets. Integer-valued entries (e.g. `331`) are stored as
+///   their `f64`; the custom [`Serialize`] writes whole numbers back without a
+///   trailing `.0` to preserve the original document's formatting.
+/// - [`DatasetValue::Cells`] — a dense array mixing numbers, strings, and
+///   nulls (e.g. `[1.5, "confidential", null]`). Falls back to the
+///   enum-tagged [`Cell`] representation so non-numeric values survive.
+/// - [`DatasetValue::Sparse`] — a JSON-stat 2.0 sparse object keyed by the
+///   decimal flat index (`{"0": 10, "3": 40}`). Missing keys read as `null`.
+///
+/// # Precision note
+/// Integer values larger than 2⁵³ (~9 quadrillion) lose precision when stored
+/// as `f64` on the `Numbers` path, exactly as they would in any JavaScript
+/// engine (where every number is a double). Datasets in this library's domain
+/// (statistical observations) never reach that range; mixed integer/float
+/// arrays are unaffected. This matches the `jsonstat-toolkit` behavior.
+#[derive(Debug, Clone)]
 pub enum DatasetValue {
-    Array(Vec<Cell>),
-    Map(HashMap<String, Cell>),
+    /// All-numeric dense array — the fast path.
+    Numbers(Vec<f64>),
+    /// Dense array mixing numbers/strings/nulls.
+    Cells(Vec<Cell>),
+    /// Sparse object keyed by decimal flat index (JSON-stat 2.0 form).
+    Sparse(HashMap<String, Cell>),
 }
 
 impl DatasetValue {
+    /// Returns the cell at `index` (row-major flat), or [`Cell::Null`] when out
+    /// of range or (for sparse) absent.
+    ///
+    /// On the `Numbers` path this boxes the `f64` back into a [`Cell`]; prefer
+    /// [`DatasetValue::get_f64`] in hot loops that only need the numeric value.
     pub fn get_at(&self, index: usize) -> Cell {
         match self {
-            Self::Array(arr) => arr.get(index).cloned().unwrap_or(Cell::Null),
-            Self::Map(map) => {
+            Self::Numbers(nums) => nums
+                .get(index)
+                .map(|&n| {
+                    Cell::Number(
+                        serde_json::Number::from_f64(n)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    )
+                })
+                .unwrap_or(Cell::Null),
+            Self::Cells(arr) => arr.get(index).cloned().unwrap_or(Cell::Null),
+            Self::Sparse(map) => {
                 // Allocation-free decimal key lookup (sparse value object).
                 let mut buf = [0u8; 20];
                 map.get(crate::query::usize_key(&mut buf, index))
                     .cloned()
                     .unwrap_or(Cell::Null)
             }
+        }
+    }
+
+    /// Zero-clone numeric access for the `Numbers` fast path. Returns `Some(f64)`
+    /// for a stored number, `None` for an absent (sparse) or non-numeric value.
+    /// Avoids boxing a [`Cell`] on every cell read in the hot `Transform` /
+    /// `Data()` loops.
+    #[inline]
+    pub fn get_f64(&self, index: usize) -> Option<f64> {
+        match self {
+            Self::Numbers(nums) => nums.get(index).copied(),
+            Self::Cells(arr) => arr.get(index).and_then(|c| c.as_f64()),
+            Self::Sparse(map) => {
+                let mut buf = [0u8; 20];
+                map.get(crate::query::usize_key(&mut buf, index))
+                    .and_then(|c| c.as_f64())
+            }
+        }
+    }
+
+    /// Returns a borrow over the `Numbers` slice when this is the all-numeric
+    /// fast path, else `None`. Lets `value`/`Transform` emit a `Float64Array`
+    /// / numeric column with a single bulk copy and no per-cell iteration.
+    #[inline]
+    pub fn as_numbers(&self) -> Option<&[f64]> {
+        match self {
+            Self::Numbers(nums) => Some(nums.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Number of stored entries (dense length, or sparse key count).
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Numbers(nums) => nums.len(),
+            Self::Cells(arr) => arr.len(),
+            Self::Sparse(map) => map.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `true` when the storage is the all-numeric fast path.
+    pub fn is_numbers(&self) -> bool {
+        matches!(self, Self::Numbers(_))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DatasetValue {
+    /// Single-pass deserialization that picks the storage variant at parse time:
+    /// an all-numeric JSON array becomes [`DatasetValue::Numbers`] (no
+    /// per-element `Cell` boxing), a mixed array becomes
+    /// [`DatasetValue::Cells`], and a JSON-stat 2.0 sparse object becomes
+    /// [`DatasetValue::Sparse`].
+    ///
+    /// Replaces the previous `#[serde(untagged)]` derive, which walked the
+    /// value twice (once into a `serde_json::Value` probe, once into the chosen
+    /// variant). The custom visitor walks once.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DatasetValueVisitor)
+    }
+}
+
+struct DatasetValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DatasetValueVisitor {
+    type Value = DatasetValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON-stat value array or sparse value object")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        // Collect as Cell first (single walk), then promote to Numbers if every
+        // cell is numeric. The promotion is a cheap conversion with no re-parse
+        // — far cheaper than serde's untagged double-walk.
+        let mut cells: Vec<Cell> = Vec::new();
+        while let Some(cell) = seq.next_element::<Cell>()? {
+            cells.push(cell);
+        }
+        if cells.iter().all(|c| matches!(c, Cell::Number(_))) {
+            let nums: Vec<f64> = cells
+                .iter()
+                .map(|c| match c {
+                    Cell::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+                    _ => unreachable!("guarded by the `all` check above"),
+                })
+                .collect();
+            Ok(DatasetValue::Numbers(nums))
+        } else {
+            Ok(DatasetValue::Cells(cells))
+        }
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut out: HashMap<String, Cell> = HashMap::new();
+        while let Some((k, v)) = map.next_entry::<String, Cell>()? {
+            out.insert(k, v);
+        }
+        Ok(DatasetValue::Sparse(out))
+    }
+}
+
+impl serde::Serialize for DatasetValue {
+    /// Serializes every variant back to its JSON-stat wire form:
+    /// - [`DatasetValue::Numbers`] → a JSON **array** of numbers. Whole-valued
+    ///   `f64`s (e.g. `331.0`) are emitted as integers (`331`) to preserve the
+    ///   original document's formatting; `serde_json` would otherwise write
+    ///   `331.0`.
+    /// - [`DatasetValue::Cells`] → a JSON array (cells serialize to number/
+    ///   string/null).
+    /// - [`DatasetValue::Sparse`] → a JSON object keyed by decimal index
+    ///   (preserving the JSON-stat 2.0 sparse form).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        match self {
+            DatasetValue::Numbers(nums) => {
+                let mut seq = serializer.serialize_seq(Some(nums.len()))?;
+                for &f in nums {
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && f >= i64::MIN as f64
+                        && f <= i64::MAX as f64
+                    {
+                        seq.serialize_element(&(f as i64))?;
+                    } else {
+                        seq.serialize_element(&f)?;
+                    }
+                }
+                seq.end()
+            }
+            DatasetValue::Cells(cells) => cells.serialize(serializer),
+            DatasetValue::Sparse(map) => map.serialize(serializer),
         }
     }
 }

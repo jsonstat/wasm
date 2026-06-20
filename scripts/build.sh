@@ -13,13 +13,18 @@
 # Usage:
 #   ./scripts/build.sh                 # release build (default)
 #   ./scripts/build.sh --dev           # debug build (no --release)
-#   TARGET=node ./scripts/build.sh     # override --target (default: web)
+#   TARGET=node ./scripts/build.sh     # node target (shorthand for nodejs)
 set -euo pipefail
 
 # ── Config ───────────────────────────────────────────────────────────────
 # Repo root = directory containing this script's parent.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${TARGET:-web}"
+# `wasm-pack --target` requires the canonical name `nodejs`; accept the shorter
+# `node` shorthand used throughout this repo's docs and map it through.
+if [[ "${TARGET}" == "node" ]]; then
+    TARGET="nodejs"
+fi
 PKG_DIR="${ROOT}/pkg"
 
 # ── Parse flags ──────────────────────────────────────────────────────────

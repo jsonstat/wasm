@@ -25,6 +25,7 @@ toolkit.
 - [What is implemented](#what-is-implemented)
 - [Try it in a webpage (simple version)](#try-it-in-a-webpage-simple-version)
 - [How it works](#how-it-works)
+- [Performance](#performance)
 - [Documentation](#documentation)
 - [License](#license)
 
@@ -146,6 +147,62 @@ compiled to a WebAssembly module. A thin JavaScript facade (`jsonstat.js`)
 loads and initializes the WASM module automatically, then exposes a familiar
 toolkit-style `JSONstat()` function. Because the heavy lifting happens in WASM,
 parsing large datasets is fast, while the JavaScript you write stays simple.
+
+---
+
+## Performance
+
+Since v0.3.0, `jsonstat-wasm` is engineered to **beat the plain JS toolkit on
+the hot paths**, not just match it. On large datasets (~100k cells) versus
+[`jsonstat-toolkit`](https://github.com/jsonstat/toolkit), measured in Chrome
+148 (via [`.idea/test/bench.html`](./.idea/test/bench.html)) and Node 23 on
+macOS (median of N runs, ratio < 1.0 = WASM wins):
+
+| Phase | WASM vs JS toolkit | Notes |
+|---|---|---|
+| **`JSONstat(string)` parse** | **~1.6–2.1× faster** ✅ | single-pass Rust `serde_json` (the `fetch().then(r=>r.text())` path) |
+| **`Transform({type:'arrobj'})`** | **~7–15× faster** ✅✅ | columnar fast path — the bigger the dataset, the bigger the win |
+| `JSONstat(obj)` parse | **~2.3–4× slower** ❌ | irreducible: the JS engine reads its own heap in place; WASM must cross the boundary per property. Use the string path (`fetch`→`text()`) instead. |
+| `ds.value` getter, `Data()` slice | tied (sub-millisecond) | `ds.value` is cached on both sides after first read |
+
+> **When is WASM slower?** Only on `JSONstat(obj)` — passing an *already-parsed*
+> JS object. The JS toolkit traverses V8's heap directly with no serialization,
+> while WASM pays a per-property boundary crossing. This path cannot be made
+> competitive without abandoning the WASM boundary entirely. The fix is to hand
+> WASM the **text** instead: `JSONstat(await response.text())` is a 2× win,
+> because a single Rust `serde_json` pass beats V8's `JSON.parse` + a JS walk.
+
+### How the speed-ups work
+
+- **Single-pass string parsing.** A `{`-leading string is handed straight to the
+  Rust constructor — one `serde_json` traversal. The previous double-parse
+  (V8's `JSON.parse` + a property-by-property boundary walk) is gone.
+- **Columnar `Transform`.** For plain `arrobj` (no `by`/`meta`), Rust emits a
+  column-oriented payload (`Float64Array` for numeric values, `Uint32Array`
+  label indices for dimension columns) and a tiny JS assembler stitches the row
+  objects together with a V8-JIT'd object literal. No per-cell `serde_json`
+  tree, no per-cell map allocation. Other transform types (`array`, `object`,
+  `objarr`, `arrobj` with `by`/`meta`) use the original serde path unchanged.
+- **Zero-copy numeric values.** An all-numeric dataset is stored as a contiguous
+  `Vec<f64>` and exposed as a `Float64Array`, so `ds.value` is one bulk copy.
+
+### Behavior changes in v0.3.0 (minor, breaking-ish)
+
+These are the trade-offs for the speed-ups. They are minor, but callers relying
+on the exact v0.2.x shapes should be aware:
+
+1. **`ds.value` returns a `Float64Array`, not an `Array`, when every value is a
+   number.** Index access (`ds.value[i]`), `.length`, and iteration work
+   identically; `Array.isArray(ds.value)` now returns `false` on all-numeric
+   datasets. Use `Array.from(ds.value)` if you need a real `Array`. Datasets
+   with strings/nulls still return a plain `Array`.
+2. **`ds.value` is cached.** Repeated reads return the same `Float64Array`/
+   `Array` instance (`ds.value === ds.value`), so the bulk copy happens once.
+   Mutating the returned buffer will affect subsequent reads — treat it as
+   read-only.
+
+See [`docs/releases/v0.3.0.md`](./docs/releases/v0.3.0.md) for the full
+change list.
 
 ---
 
