@@ -61,6 +61,15 @@ jobs:
             exit 1
           fi
 
+      # ── Setup Node (needed by build.sh's minify step, the type-check, and
+      # the publish step's registry-url config). Moved ahead of the build so
+      # `npx esbuild` in scripts/build.sh has Node on PATH.
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
       # ── Verification gates (mirror ci.yml) ───────────────────────────────
       - name: Run tests
         run: cargo test
@@ -69,12 +78,6 @@ jobs:
         run: bash scripts/build.sh
 
       # ── Publish to npm ───────────────────────────────────────────────────
-      - name: Setup Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-
       - name: Type-check bindings
         run: npx --yes -p typescript@5 tsc --noEmit
 

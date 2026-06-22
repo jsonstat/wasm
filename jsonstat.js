@@ -25,7 +25,7 @@
 // That means a CDN consumer can simply:
 //
 //     import { JSONstat }
-//       from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.3.0/jsonstat.js';
+//       from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.4.1/jsonstat.js';
 //
 // and initialization is fully automatic.
 //
