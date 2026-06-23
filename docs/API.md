@@ -1,20 +1,101 @@
 # API Reference — JSON-stat WebAssembly
 
 > This is the API reference for the **JSON-stat WebAssembly** library (`jsonstat-wasm`).
-> For the original JSON-stat JavaScript Toolkit API, see [toolkit-api.md](toolkit-api.md).
+> For the original JSON-stat JavaScript Toolkit API, see the [upstream toolkit API docs](https://github.com/jsonstat/toolkit/blob/master/docs/API.md).
 
 ## Overview
 
 The library exposes a single class, `JSONstat`, which parses a [JSON-stat 2.0](https://json-stat.org/format/) string into a WebAssembly-managed object. It supports three response classes: **dataset**, **collection**, and **dimension**.
 
+> 🧪 **Live examples:** runnable `jsonstat-wasm` snippets live on
+> [jsonstat.com/examples?lib=wasm](https://jsonstat.com/examples/?lib=wasm).
+
+There are two ways to obtain a `JSONstat` instance — the **high-level facade**
+([`jsonstat.js`](../jsonstat.js), recommended) and the **raw glue**
+(`jsonstat_wasm.js`, advanced). Both return the same class, so the methods and
+properties documented below apply identically to either. See [Entry points](#entry-points).
+
+```js
+// Facade (recommended): no init(), no `new`
+import { JSONstat } from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.4.1/jsonstat.js';
+
+const ds = await JSONstat('https://json-stat.org/samples/oecd.json');
+```
+
+---
+
+## Entry points
+
+### The facade (`jsonstat.js`) — recommended
+
+The high-level facade exposes a single toolkit-style function, `JSONstat(input,
+options)`. It initializes the WASM module exactly once on first import and gates
+every call behind that shared promise, so you never call `init()` yourself and
+never use `new`.
+
+From a CDN (no build step):
+
+```js
+import { JSONstat }
+  from 'https://cdn.jsdelivr.net/npm/jsonstat-wasm@0.4.1/jsonstat.js';
+// …or unpkg:
+// import { JSONstat } from 'https://unpkg.com/jsonstat-wasm@0.4.1/jsonstat.js';
+```
+
+Or as an npm / bundler import:
+
+```js
+import { JSONstat } from 'jsonstat-wasm';
+```
+
+The `input` argument is overloaded:
+
+| `input` | Behavior | Returns |
+|---------|----------|---------|
+| `"version"` | Package version (baked into the WASM binary) | `Promise<string>` |
+| URL string | Fetches the URL, then parses the body | `Promise<JSONstat>` |
+| Inline JSON-stat string (leading `{`) | Parsed in a single Rust `serde_json` pass (no double `JSON.parse`) | `Promise<JSONstat>` |
+| Object | Parses an in-memory JSON-stat object | `Promise<JSONstat>` |
+
+`options` (optional, `RequestInit`) is forwarded to `fetch()` and only used when
+`input` is a URL.
+
+```js
+const ds  = await JSONstat('https://json-stat.org/samples/oecd.json'); // URL
+const ds2 = await JSONstat(jsonStr);       // inline JSON-stat string
+const ds3 = await JSONstat(parsedObj);     // already-parsed object
+console.log(await JSONstat('version'));    // "0.4.1"
+```
+
+> **`"version"` returns a Promise:** the version is baked into the WASM binary
+> via `env!("CARGO_PKG_VERSION")`, so it must await the init gate — unlike the
+> plain-JS toolkit, where it is synchronous.
+>
+> **Do not use `new`:** call `JSONstat(...)` as a plain function. The facade
+> wraps the WASM class internally.
+
+The facade wraps the returned dataset in a transparent `Proxy` that routes
+`Transform({ type: "arrobj" })` (without `by` / `meta`) through a columnar fast
+path and memoizes `value`; every other access passes through unchanged, so the
+rest of this reference applies without modification.
+
+### The raw glue (`jsonstat_wasm.js`) — advanced
+
+Use this only when you need the WASM class directly — for example, an explicit
+`init(url)` on CDNs that rewrite `import.meta.url`. You must call `init()`
+yourself and instantiate with `new`:
+
 ```js
 import init, { JSONstat, init_panic_hook } from './pkg/jsonstat_wasm.js';
 
-await init();
-init_panic_hook(); // Optional: better error messages in console
-
+await init();          // required
+init_panic_hook();     // optional, better error messages in the console
 const ds = new JSONstat(jsonStr);
 ```
+
+See [Constructor](#constructor) for the class constructor, and the
+[Installation → CDN](./INSTALL.md#cdn-no-build-step-no-install) section for the
+explicit `init(url)` form.
 
 ---
 
@@ -710,3 +791,11 @@ Common error cases:
 | Missing dimension | `"Dimension '...' not found"` |
 | Missing category | `"Category '...' not found in dimension '...'"` |
 | Invalid query | `"Query is missing category for non-constant dimension '...'"` |
+
+---
+
+## See also
+
+- 🧪 [Live examples](https://jsonstat.com/examples/?lib=wasm) — runnable `jsonstat-wasm` snippets on jsonstat.com.
+- 📖 [Installation guide](./INSTALL.md) — building from source, npm/bundlers, CDN usage, and the Rust library API.
+- 🔗 [Upstream toolkit API](https://github.com/jsonstat/toolkit/blob/master/docs/API.md) — the original JSON-stat JavaScript Toolkit reference.

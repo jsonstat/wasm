@@ -212,6 +212,8 @@ change list.
   with npm/bundlers, CDN usage, and the Rust library API.
 - 📚 [**API reference**](./docs/API.md) — every method and property exposed by
   the `JSONstat` class.
+- 🧪 [**Live examples**](https://jsonstat.com/examples/?lib=wasm) — runnable
+  `jsonstat-wasm` examples on jsonstat.com.
 
 ---
 
